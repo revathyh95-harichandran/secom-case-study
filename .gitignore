@@ -1,0 +1,43 @@
+# Private planning documents and personal logs (never on GitHub)
+CLAUDE.md
+PROJECT_LITERATURE_REVIEW.md
+PROJECT_BLUEPRINT.md
+RULES_BOOK.md
+EXECUTION_GUIDE.md
+THEORY_GUIDE.md
+QA_SESSION_PREP.md
+DECISIONS.md
+DEBUG_LOG.md
+CONCEPTS.md
+AI_USAGE.md
+EXPERIMENT_LOG.md
+SIP_LOG.md
+
+# Claude Code settings
+.claude/
+
+# Python virtual environment
+.venv/
+
+# VS Code settings for this laptop
+.vscode/
+
+# Data: the script downloads it at runtime, so no copy is ever stored
+data/
+*.data
+*.names
+
+# Papers, professor's templates, slides and the team zip
+*.pdf
+*.pptx
+*.docx
+*.zip
+
+# Files Python and Jupyter create automatically
+__pycache__/
+.ipynb_checkpoints/
+
+# Operating system files
+.DS_Store
+Thumbs.db
+desktop.ini
