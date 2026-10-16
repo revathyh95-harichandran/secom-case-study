@@ -125,6 +125,12 @@ COST_FALSE_NEGATIVE = 5000
 # Share of wafers held back as the test set: the 80/20 split from manual Section 3.
 TEST_SIZE = 0.2
 
+# Missing-value threshold in percent (decision D5): columns with MORE missing
+# values than this in the training set are removed in Block 5. 60 % is the
+# manual's starting point; on the training set any threshold from 49.1 % to
+# 61.2 %, including the papers' 55 %, removes exactly the same 24 columns.
+MISSING_THRESHOLD = 60
+
 # Download links of the two original files in the UCI repository (dataset 179).
 URL_SENSOR_DATA = "https://archive.ics.uci.edu/ml/machine-learning-databases/secom/secom.data"
 URL_LABELS = "https://archive.ics.uci.edu/ml/machine-learning-databases/secom/secom_labels.data"
@@ -263,6 +269,120 @@ def save_figure(figure, file_name):
     print("Saved figure:", file_path)
 
 
+def plot_variance_histogram(column_variances, title, file_name):
+    """
+    Draw a histogram of column variances on a log10 scale and save it.
+    Variances span many orders of magnitude, so log10 is used (-2 = 0.01,
+    0 = 1, 2 = 100). The log of 0 does not exist, so zero variances are left out.
+
+    Input:  column_variances (Series: one variance per column), title (str), file_name (str)
+    Output: none (the figure is saved)
+    """
+    nonzero_variances = column_variances[column_variances > 0]
+    log_variances = np.log10(nonzero_variances)
+    figure, axis = plt.subplots(figsize=(8, 4))
+    axis.hist(log_variances, bins=40, color=COLOR_MAIN, edgecolor="white")
+    axis.set_xlabel("Column variance, log10 scale (-2 = 0.01, 0 = 1, 2 = 100)")
+    axis.set_ylabel("Number of columns")
+    axis.set_title(title)
+    axis.spines["top"].set_visible(False)
+    axis.spines["right"].set_visible(False)
+    save_figure(figure, file_name)
+
+
+def plot_variance_pareto(column_variances, title, file_name):
+    """
+    Draw a Pareto chart of variance thresholds (x, log scale) against the number
+    of columns with a variance at or below each threshold (y), and save it.
+    np.logspace(-8, 8, 33) gives 33 thresholds from 10^-8 to 10^8, two per
+    power of ten, covering the range of SECOM's variances.
+
+    Input:  column_variances (Series: one variance per column), title (str), file_name (str)
+    Output: DataFrame with the columns variance_threshold and columns_at_or_below
+    """
+    variance_thresholds = np.logspace(-8, 8, 33)
+    columns_at_or_below = []
+    for threshold in variance_thresholds:
+        columns_at_or_below.append((column_variances <= threshold).sum())
+
+    figure, axis = plt.subplots(figsize=(8, 4))
+    axis.plot(variance_thresholds, columns_at_or_below, marker="o", markersize=4,
+              linewidth=2, color=COLOR_MAIN)
+    axis.set_xscale("log")
+    # A reference line for the zero-variance columns, only if there are any.
+    zero_count = (column_variances == 0).sum()
+    if zero_count > 0:
+        axis.axhline(zero_count, linestyle="--", color=COLOR_REFERENCE)
+        axis.text(variance_thresholds[-1], zero_count + 10, str(zero_count) + " zero-variance columns ",
+                  ha="right", va="bottom", color=COLOR_REFERENCE)
+    axis.set_xlabel("Variance threshold (log scale)")
+    axis.set_ylabel("Columns with variance at or below threshold")
+    axis.set_title(title)
+    axis.spines["top"].set_visible(False)
+    axis.spines["right"].set_visible(False)
+    save_figure(figure, file_name)
+
+    return pd.DataFrame({"variance_threshold": variance_thresholds,
+                         "columns_at_or_below": columns_at_or_below})
+
+
+def plot_missing_per_column(missing_percent_per_column, title, file_name):
+    """
+    Draw the manual's missing-value "histogram": one bar per column (x = column,
+    y = % missing), sorted from most to least missing, with reference lines at
+    55 % (papers) and 60 % (manual), and save it.
+
+    Input:  missing_percent_per_column (Series: % missing per column), title (str), file_name (str)
+    Output: none (the figure is saved)
+    """
+    missing_percent_sorted = missing_percent_per_column.sort_values(ascending=False)
+    figure, axis = plt.subplots(figsize=(10, 4))
+    column_positions = range(len(missing_percent_sorted))
+    axis.bar(column_positions, missing_percent_sorted.values, width=1.0, color=COLOR_MAIN)
+    for reference_percent in [55, 60]:
+        axis.axhline(reference_percent, linestyle="--", linewidth=1, color=COLOR_REFERENCE)
+    axis.text(len(missing_percent_sorted), 55, "55 % (papers) ", ha="right", va="top", color=COLOR_REFERENCE)
+    axis.text(len(missing_percent_sorted), 60, "60 % (manual) ", ha="right", va="bottom", color=COLOR_REFERENCE)
+    axis.set_xlabel("Sensor columns, sorted from most to least missing ("
+                    + str(len(missing_percent_sorted)) + " columns)")
+    axis.set_ylabel("% missing")
+    axis.set_title(title)
+    axis.spines["top"].set_visible(False)
+    axis.spines["right"].set_visible(False)
+    save_figure(figure, file_name)
+
+
+def plot_missing_pareto(missing_percent_per_column, title, file_name):
+    """
+    Draw a Pareto chart of missing-value thresholds 0, 5, ..., 100 % (x) against
+    the number of columns with MORE missing values than the threshold, i.e. the
+    columns that would be removed (y), and save it.
+
+    Input:  missing_percent_per_column (Series: % missing per column), title (str), file_name (str)
+    Output: DataFrame with the columns threshold_percent and columns_removed
+    """
+    missing_thresholds = list(range(0, 101, 5))
+    columns_removed = []
+    for threshold in missing_thresholds:
+        columns_removed.append((missing_percent_per_column > threshold).sum())
+
+    figure, axis = plt.subplots(figsize=(8, 4))
+    axis.plot(missing_thresholds, columns_removed, marker="o", markersize=5, linewidth=2, color=COLOR_MAIN)
+    for reference_percent in [55, 60]:
+        axis.axvline(reference_percent, linestyle="--", linewidth=1, color=COLOR_REFERENCE)
+    axis.text(55, max(columns_removed), "55 % ", ha="right", va="top", color=COLOR_REFERENCE)
+    axis.text(60, max(columns_removed), " 60 %", ha="left", va="top", color=COLOR_REFERENCE)
+    axis.set_xlabel("Missing-value threshold (%)")
+    axis.set_ylabel("Columns that would be removed")
+    axis.set_title(title)
+    axis.spines["top"].set_visible(False)
+    axis.spines["right"].set_visible(False)
+    save_figure(figure, file_name)
+
+    return pd.DataFrame({"threshold_percent": missing_thresholds,
+                         "columns_removed": columns_removed})
+
+
 # ----- 3.1 Structure: shape, data types, duplicated rows (manual 2.2) -----
 print("\n--- 3.1 Structure ---")
 print("Shape of X (wafers, sensors):", X.shape)
@@ -348,50 +468,20 @@ print("Columns with variance exactly 0:", len(zero_variance_columns))
 
 # ----- 3.5 Low-variance analysis: histogram and Pareto chart -----
 print("\n--- 3.5 Low-variance analysis ---")
-# Variances range over many orders of magnitude, so the histogram uses log10:
-# -2 means 0.01, 0 means 1, 2 means 100. The log of 0 does not exist, so the
-# zero-variance columns are left out of this histogram and named in the title.
-nonzero_variances = column_variances[column_variances > 0]
-log_variances = np.log10(nonzero_variances)
-figure, axis = plt.subplots(figsize=(8, 4))
-axis.hist(log_variances, bins=40, color=COLOR_MAIN, edgecolor="white")
-axis.set_xlabel("Column variance, log10 scale (-2 = 0.01, 0 = 1, 2 = 100)")
-axis.set_ylabel("Number of columns")
-axis.set_title("Variance per column, full data (" + str(len(zero_variance_columns))
-               + " zero-variance columns not shown)")
-axis.spines["top"].set_visible(False)
-axis.spines["right"].set_visible(False)
-save_figure(figure, "block3_02_variance_histogram.png")
-
-# Pareto chart: for each candidate threshold, how many columns have a variance
-# at or below it. np.logspace(-8, 8, 33) gives 33 thresholds from 10^-8 to 10^8,
-# two per power of ten, matching the range of the variances.
-variance_thresholds = np.logspace(-8, 8, 33)
-columns_at_or_below = []
-for threshold in variance_thresholds:
-    columns_at_or_below.append((column_variances <= threshold).sum())
-variance_pareto = pd.DataFrame({"variance_threshold": variance_thresholds,
-                                "columns_at_or_below": columns_at_or_below})
+# Histogram and Pareto chart of the column variances (functions above).
+plot_variance_histogram(column_variances,
+                        "Variance per column, full data (" + str(len(zero_variance_columns))
+                        + " zero-variance columns not shown)",
+                        "block3_02_variance_histogram.png")
+variance_pareto = plot_variance_pareto(column_variances,
+                                       "Low-variance Pareto chart, full data (analysis only, no action)",
+                                       "block3_03_variance_pareto.png")
 variance_pareto.to_csv(TABLES_FOLDER / "block3_variance_pareto.csv", index=False)
 
-figure, axis = plt.subplots(figsize=(8, 4))
-axis.plot(variance_thresholds, columns_at_or_below, marker="o", markersize=4,
-          linewidth=2, color=COLOR_MAIN)
-axis.set_xscale("log")
-axis.axhline(len(zero_variance_columns), linestyle="--", color=COLOR_REFERENCE)
-axis.text(variance_thresholds[-1], len(zero_variance_columns) + 10,
-          str(len(zero_variance_columns)) + " zero-variance columns ",
-          ha="right", va="bottom", color=COLOR_REFERENCE)
-axis.set_xlabel("Variance threshold (log scale)")
-axis.set_ylabel("Columns with variance at or below threshold")
-axis.set_title("Low-variance Pareto chart, full data (analysis only, no action)")
-axis.spines["top"].set_visible(False)
-axis.spines["right"].set_visible(False)
-save_figure(figure, "block3_03_variance_pareto.png")
-
 # Print the count at each power of ten (every second threshold).
-for position in range(0, len(variance_thresholds), 2):
-    print("  variance <=", variance_thresholds[position], ":", columns_at_or_below[position], "columns")
+for position in range(0, len(variance_pareto), 2):
+    print("  variance <=", variance_pareto["variance_threshold"][position], ":",
+          variance_pareto["columns_at_or_below"][position], "columns")
 
 
 # ----- 3.6 Missing values: totals, per-column chart and Pareto chart (manual 2.5) -----
@@ -411,44 +501,16 @@ print(missing_percent_sorted.head(10).round(1))
 missing_percent_sorted.round(2).to_csv(TABLES_FOLDER / "block3_missing_per_column.csv",
                                         header=["percent_missing"])
 
-# (a) The manual's "histogram": one bar per column (x = column, y = % missing),
-# sorted from most to least missing so the pattern is visible at a glance.
-figure, axis = plt.subplots(figsize=(10, 4))
-column_positions = range(len(missing_percent_sorted))
-axis.bar(column_positions, missing_percent_sorted.values, width=1.0, color=COLOR_MAIN)
-for reference_percent in [55, 60]:
-    axis.axhline(reference_percent, linestyle="--", linewidth=1, color=COLOR_REFERENCE)
-axis.text(len(missing_percent_sorted), 55, "55 % (papers) ", ha="right", va="top", color=COLOR_REFERENCE)
-axis.text(len(missing_percent_sorted), 60, "60 % (manual) ", ha="right", va="bottom", color=COLOR_REFERENCE)
-axis.set_xlabel("Sensor columns, sorted from most to least missing (" + str(len(X.columns)) + " columns)")
-axis.set_ylabel("% missing")
-axis.set_title("Missing values per column, full data")
-axis.spines["top"].set_visible(False)
-axis.spines["right"].set_visible(False)
-save_figure(figure, "block3_04_missing_per_column.png")
+# (a) Per-column chart and (b) Pareto chart (functions above).
+plot_missing_per_column(missing_percent_per_column, "Missing values per column, full data",
+                        "block3_04_missing_per_column.png")
+missing_pareto = plot_missing_pareto(missing_percent_per_column,
+                                     "Missingness Pareto chart, full data (no threshold chosen here)",
+                                     "block3_05_missing_pareto.png")
 
-# (b) Pareto chart: for each threshold 0, 5, ..., 100 %, how many columns have
-# MORE missing values than the threshold, i.e. would be removed at that threshold.
-missing_thresholds = list(range(0, 101, 5))
-columns_removed = []
-for threshold in missing_thresholds:
-    columns_removed.append((missing_percent_per_column > threshold).sum())
-
-figure, axis = plt.subplots(figsize=(8, 4))
-axis.plot(missing_thresholds, columns_removed, marker="o", markersize=5, linewidth=2, color=COLOR_MAIN)
-for reference_percent in [55, 60]:
-    axis.axvline(reference_percent, linestyle="--", linewidth=1, color=COLOR_REFERENCE)
-axis.text(55, max(columns_removed), "55 % ", ha="right", va="top", color=COLOR_REFERENCE)
-axis.text(60, max(columns_removed), " 60 %", ha="left", va="top", color=COLOR_REFERENCE)
-axis.set_xlabel("Missing-value threshold (%)")
-axis.set_ylabel("Columns that would be removed")
-axis.set_title("Missingness Pareto chart, full data (no threshold chosen here)")
-axis.spines["top"].set_visible(False)
-axis.spines["right"].set_visible(False)
-save_figure(figure, "block3_05_missing_pareto.png")
-
-for position in range(len(missing_thresholds)):
-    print("  missing >", missing_thresholds[position], "% :", columns_removed[position], "columns")
+for position in range(len(missing_pareto)):
+    print("  missing >", missing_pareto["threshold_percent"][position], "% :",
+          missing_pareto["columns_removed"][position], "columns")
 
 
 # ----- 3.7 Missing values by class (manual 2.5) -----
@@ -628,8 +690,138 @@ save_figure(figure, "block4_01_failure_share_split.png")
 # - y_test is not used at all before Block 17.
 # ---------------------------------------------------------------------------
 
-# %% Block 5: Rough feature reduction
-# Remove constant, duplicate and very incomplete columns on the training set, mirrored to the test set (Phase 1).
+# %% Block 5: Rough feature reduction (training set only)
+# A first, conservative reduction that removes only columns that clearly carry
+# no information or are mostly empty: zero-variance columns, duplicated columns
+# and columns above the missing-value threshold (manual Section 4.1 to 4.5;
+# "Cleaning of Training Set" in the professor's slides). Every decision is
+# calculated on X_train only. Each list of removed columns is stored, so that
+# exactly the same columns are removed from X_test at the final evaluation
+# (Block 17). X_test is not used in this block.
+
+# Working copy of the training set, so X_train itself stays unchanged.
+X_train_reduced = X_train.copy()
+
+# Each step adds one row to this before -> after table.
+reduction_rows = [{"step": "Original training set",
+                   "columns_before": X_train.shape[1],
+                   "columns_removed": 0,
+                   "columns_after": X_train.shape[1]}]
+
+
+# ----- 5.1 Duplicated rows in the training set -----
+print("\n--- 5.1 Duplicated rows (training set) ---")
+# A duplicated wafer would count twice in training. Rows are only ever removed
+# from the training set; test wafers are never removed.
+duplicated_training_rows = X_train_reduced.duplicated().sum()
+print("Duplicated rows in the training set:", duplicated_training_rows)
+if duplicated_training_rows > 0:
+    keep_rows = ~X_train_reduced.duplicated()
+    X_train_reduced = X_train_reduced[keep_rows]
+    y_train = y_train[keep_rows]
+    print("Removed duplicated rows; training wafers now:", len(X_train_reduced))
+
+
+# ----- 5.2 Zero-variance columns (manual 4.2) -----
+print("\n--- 5.2 Zero-variance columns (training set) ---")
+# Variance per column on the training set (pandas default ddof=1, missing values
+# ignored). A column with variance 0 has the same value for every training wafer.
+training_variances = X_train_reduced.var()
+removed_zero_variance = training_variances[training_variances == 0].index.tolist()
+columns_before = X_train_reduced.shape[1]
+X_train_reduced = X_train_reduced.drop(columns=removed_zero_variance)
+print("Columns before:", columns_before, "| removed:", len(removed_zero_variance),
+      "| after:", X_train_reduced.shape[1])
+reduction_rows.append({"step": "Zero-variance columns removed",
+                       "columns_before": columns_before,
+                       "columns_removed": len(removed_zero_variance),
+                       "columns_after": X_train_reduced.shape[1]})
+
+
+# ----- 5.3 Duplicated columns (manual 4.3) -----
+print("\n--- 5.3 Duplicated columns (training set) ---")
+# .T turns columns into rows, so duplicated() can compare whole columns; it marks
+# every column that is identical to an earlier column (the first one is kept).
+duplicated_column_mask = X_train_reduced.T.duplicated()
+removed_duplicate_columns = X_train_reduced.columns[duplicated_column_mask].tolist()
+columns_before = X_train_reduced.shape[1]
+X_train_reduced = X_train_reduced.drop(columns=removed_duplicate_columns)
+print("Columns before:", columns_before, "| removed:", len(removed_duplicate_columns),
+      "| after:", X_train_reduced.shape[1])
+reduction_rows.append({"step": "Duplicated columns removed",
+                       "columns_before": columns_before,
+                       "columns_removed": len(removed_duplicate_columns),
+                       "columns_after": X_train_reduced.shape[1]})
+
+
+# ----- 5.4 Low-variance analysis (analysis only, NO action) -----
+print("\n--- 5.4 Low-variance analysis (training set, no action) ---")
+# Same histogram and Pareto chart as in Block 3, now on the remaining training
+# columns. No column is removed (professor's slide 8): a small variance can
+# simply reflect a sensor's unit, not a lack of information.
+training_variances = X_train_reduced.var()
+plot_variance_histogram(training_variances,
+                        "Variance per column, training set (" + str(X_train_reduced.shape[1]) + " columns)",
+                        "block5_01_variance_histogram_train.png")
+variance_pareto_train = plot_variance_pareto(training_variances,
+                                             "Low-variance Pareto chart, training set (analysis only, no action)",
+                                             "block5_02_variance_pareto_train.png")
+for position in range(0, len(variance_pareto_train), 2):
+    print("  variance <=", variance_pareto_train["variance_threshold"][position], ":",
+          variance_pareto_train["columns_at_or_below"][position], "columns")
+
+
+# ----- 5.5 Missing values and threshold (decision D5, manual 4.4 and 4.5) -----
+print("\n--- 5.5 Missing values (training set) ---")
+missing_percent_train = X_train_reduced.isna().mean() * 100
+total_missing_train = X_train_reduced.isna().sum().sum()
+print("Missing values in the training set:", total_missing_train, "(",
+      round(total_missing_train / X_train_reduced.size * 100, 2), "% of cells )")
+
+plot_missing_per_column(missing_percent_train, "Missing values per column, training set",
+                        "block5_03_missing_per_column_train.png")
+missing_pareto_train = plot_missing_pareto(missing_percent_train,
+                                           "Missingness Pareto chart, training set",
+                                           "block5_04_missing_pareto_train.png")
+for position in range(len(missing_pareto_train)):
+    print("  missing >", missing_pareto_train["threshold_percent"][position], "% :",
+          missing_pareto_train["columns_removed"][position], "columns")
+
+# Columns with MORE missing values than MISSING_THRESHOLD are removed (manual 4.5).
+removed_missing_columns = missing_percent_train[missing_percent_train > MISSING_THRESHOLD].index.tolist()
+print("Columns above", MISSING_THRESHOLD, "% missing (with their % missing):")
+print(missing_percent_train[removed_missing_columns].sort_values(ascending=False).round(2))
+columns_before = X_train_reduced.shape[1]
+X_train_reduced = X_train_reduced.drop(columns=removed_missing_columns)
+print("Columns before:", columns_before, "| removed:", len(removed_missing_columns),
+      "| after:", X_train_reduced.shape[1])
+reduction_rows.append({"step": "Columns with more than " + str(MISSING_THRESHOLD) + " % missing removed",
+                       "columns_before": columns_before,
+                       "columns_removed": len(removed_missing_columns),
+                       "columns_after": X_train_reduced.shape[1]})
+
+
+# ----- 5.6 Before -> after table and the stored rule for the test set -----
+print("\n--- 5.6 Feature reduction summary ---")
+reduction_table = pd.DataFrame(reduction_rows)
+print(reduction_table.to_string(index=False))
+reduction_table.to_csv(TABLES_FOLDER / "block5_feature_reduction.csv", index=False)
+
+# One list of every removed column with its reason. This is the stored rule:
+# at the final evaluation (Block 17), X_test.drop(columns=columns_removed_in_block5)
+# removes exactly these columns from the test set.
+columns_removed_in_block5 = removed_zero_variance + removed_duplicate_columns + removed_missing_columns
+removed_reasons = []
+for column in removed_zero_variance:
+    removed_reasons.append({"column": column, "reason": "zero variance"})
+for column in removed_duplicate_columns:
+    removed_reasons.append({"column": column, "reason": "duplicate of another column"})
+for column in removed_missing_columns:
+    removed_reasons.append({"column": column,
+                            "reason": "more than " + str(MISSING_THRESHOLD) + " % missing"})
+pd.DataFrame(removed_reasons).to_csv(TABLES_FOLDER / "block5_removed_columns.csv", index=False)
+print("Columns removed in total:", len(columns_removed_in_block5),
+      "| remaining training columns:", X_train_reduced.shape[1])
 
 # %% Block 6: Correlation heatmap
 # Visualise correlations between the remaining sensors, without removing any (Phase 1).

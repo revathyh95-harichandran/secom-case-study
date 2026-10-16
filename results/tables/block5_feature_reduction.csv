@@ -1,0 +1,5 @@
+step,columns_before,columns_removed,columns_after
+Original training set,590,0,590
+Zero-variance columns removed,590,116,474
+Duplicated columns removed,474,0,474
+Columns with more than 60 % missing removed,474,24,450
