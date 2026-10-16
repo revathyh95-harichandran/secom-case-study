@@ -135,6 +135,14 @@ MISSING_THRESHOLD = 60
 # value in manual 4.6 and the papers). No column is removed because of it.
 CORRELATION_LIMIT = 0.8
 
+# Outliers (manual Section 5): a value more than OUTLIER_SIGMA standard
+# deviations from its column's training mean is an outlier (3 sigma rule; the
+# IQR method is not allowed, rule 4). OUTLIER_TREATMENT (decision D7) is one of
+# "nothing", "cap" or "remove"; "cap" keeps every wafer and value but pulls
+# extreme values back to the bound. All three stay available for the grid search.
+OUTLIER_SIGMA = 3
+OUTLIER_TREATMENT = "cap"
+
 # Download links of the two original files in the UCI repository (dataset 179).
 URL_SENSOR_DATA = "https://archive.ics.uci.edu/ml/machine-learning-databases/secom/secom.data"
 URL_LABELS = "https://archive.ics.uci.edu/ml/machine-learning-databases/secom/secom_labels.data"
@@ -890,8 +898,166 @@ plot_correlation_heatmap(correlation_matrix_train,
                          "block6_01_correlation_heatmap_train.png")
 print("No columns removed; training columns remain:", X_train_reduced.shape[1])
 
-# %% Block 7: Outliers (3 sigma rule)
-# Detect outliers with the 3 sigma rule and apply the chosen treatment (Phase 1).
+# %% Block 7: Outliers with the 3 sigma rule (training set only)
+# Flags extreme values per sensor with the 3 sigma rule and applies the chosen
+# treatment (decision D7) to the training set (manual Section 5; rule 4: no IQR).
+# The mean, standard deviation and bounds are computed on the training set only
+# and stored, so the same bounds can be applied to the test set in Block 17.
+# All three treatments are written as functions so the grid search (Block 15)
+# can compare them.
+
+
+def find_outliers(data, lower_bounds, upper_bounds):
+    """
+    Mark every value below its column's lower bound or above its upper bound.
+    Missing values are never marked (a comparison with NaN is always False).
+
+    Input:  data (DataFrame), lower_bounds and upper_bounds (Series: one bound per column)
+    Output: DataFrame of True/False with the same shape as data (True = outlier)
+    """
+    # axis="columns" lines each bound up with the column of the same name.
+    below = data.lt(lower_bounds, axis="columns")
+    above = data.gt(upper_bounds, axis="columns")
+    return below | above
+
+
+def treat_outliers_nothing(data, lower_bounds, upper_bounds):
+    """
+    Option "do nothing": keep every value as measured (the baseline).
+
+    Input:  data (DataFrame), lower_bounds and upper_bounds (Series; not used, kept so
+            all three options are called the same way)
+    Output: an unchanged copy of data
+    """
+    return data.copy()
+
+
+def treat_outliers_cap(data, lower_bounds, upper_bounds):
+    """
+    Option "cap" (winsorising): pull every value beyond a bound back to that bound.
+
+    Input:  data (DataFrame), lower_bounds and upper_bounds (Series: one bound per column)
+    Output: a copy of data with outliers replaced by the nearest bound
+    """
+    # clip() with axis=1 uses each column's own bounds; missing values stay missing.
+    return data.clip(lower=lower_bounds, upper=upper_bounds, axis=1)
+
+
+def treat_outliers_remove(data, lower_bounds, upper_bounds):
+    """
+    Option "remove": replace every outlier with a missing value (a gap that the
+    kNN imputation in Block 8 has to fill).
+
+    Input:  data (DataFrame), lower_bounds and upper_bounds (Series: one bound per column)
+    Output: a copy of data with outliers replaced by NaN
+    """
+    # mask() puts NaN wherever the outlier table is True.
+    return data.mask(find_outliers(data, lower_bounds, upper_bounds))
+
+
+def apply_outlier_treatment(option, data, lower_bounds, upper_bounds):
+    """
+    Apply one of the three outlier treatments by name.
+
+    Input:  option (str: "nothing", "cap" or "remove"), data (DataFrame),
+            lower_bounds and upper_bounds (Series: one bound per column)
+    Output: the treated copy of data
+    """
+    if option == "nothing":
+        return treat_outliers_nothing(data, lower_bounds, upper_bounds)
+    elif option == "cap":
+        return treat_outliers_cap(data, lower_bounds, upper_bounds)
+    elif option == "remove":
+        return treat_outliers_remove(data, lower_bounds, upper_bounds)
+    else:
+        raise ValueError("Unknown outlier treatment: " + str(option))
+
+
+# ----- 7.1 Bounds from the training set (stored for the test set) -----
+print("\n--- 7.1 Outlier bounds (training set) ---")
+# mean() and std() per column on the training set only. std() is the sample
+# standard deviation (pandas default ddof=1); both ignore missing values.
+training_means = X_train_reduced.mean()
+training_stds = X_train_reduced.std()
+lower_bounds = training_means - OUTLIER_SIGMA * training_stds
+upper_bounds = training_means + OUTLIER_SIGMA * training_stds
+bounds_table = pd.DataFrame({"mean": training_means, "std": training_stds,
+                             "lower_bound": lower_bounds, "upper_bound": upper_bounds})
+bounds_table.to_csv(TABLES_FOLDER / "block7_outlier_bounds.csv")
+print("Bounds stored for", len(bounds_table), "columns (mean +/-", OUTLIER_SIGMA, "standard deviations)")
+
+
+# ----- 7.2 How many values are flagged? -----
+print("\n--- 7.2 Flagged values (training set) ---")
+outlier_mask = find_outliers(X_train_reduced, lower_bounds, upper_bounds)
+flags_per_column = outlier_mask.sum()
+total_flagged = flags_per_column.sum()
+measured_values = X_train_reduced.notna().sum().sum()
+print("Values flagged:", total_flagged, "of", measured_values, "measured values (",
+      round(total_flagged / measured_values * 100, 2), "% )")
+# Under a perfect bell curve about 0.27 % of values lie beyond 3 sigma.
+print("Expected under a normal distribution (0.27 %):", round(measured_values * 0.0027))
+print("Sensors with at least one flagged value:", (flags_per_column > 0).sum(), "of",
+      X_train_reduced.shape[1])
+
+top10_outlier_sensors = flags_per_column.sort_values(ascending=False).head(10)
+print("Ten most affected sensors (flagged values):")
+print(top10_outlier_sensors)
+top10_outlier_sensors.to_csv(TABLES_FOLDER / "block7_top10_outlier_sensors.csv",
+                             header=["flagged_values"])
+
+# Are outliers more common in failed wafers? Count flags per wafer, then average
+# per class (training labels only, describing, nothing is fitted).
+flags_per_wafer = outlier_mask.sum(axis=1)
+flags_by_class = flags_per_wafer.groupby(y_train).mean()
+print("Average flagged values per wafer: pass", round(flags_by_class[0], 2),
+      "| fail", round(flags_by_class[1], 2))
+
+
+# ----- 7.3 Compare the three options, then apply the chosen one (D7) -----
+print("\n--- 7.3 Outlier treatment options (training set) ---")
+missing_before_treatment = X_train_reduced.isna().sum().sum()
+option_rows = []
+for option in ["nothing", "cap", "remove"]:
+    treated = apply_outlier_treatment(option, X_train_reduced, lower_bounds, upper_bounds)
+    # A value counts as changed if it differs from before; NaN != NaN is True in
+    # pandas, so cells missing before AND after are excluded.
+    both_missing = X_train_reduced.isna() & treated.isna()
+    values_changed = ((treated != X_train_reduced) & ~both_missing).sum().sum()
+    option_rows.append({"option": option,
+                        "values_changed": values_changed,
+                        "missing_before": missing_before_treatment,
+                        "missing_after": treated.isna().sum().sum()})
+options_table = pd.DataFrame(option_rows)
+print(options_table.to_string(index=False))
+options_table.to_csv(TABLES_FOLDER / "block7_outlier_options.csv", index=False)
+
+# Apply the chosen treatment to the training set. The stored bounds are applied
+# to the test set with the same function in Block 17.
+X_train_treated = apply_outlier_treatment(OUTLIER_TREATMENT, X_train_reduced, lower_bounds, upper_bounds)
+print("Chosen treatment:", OUTLIER_TREATMENT, "| training shape:", X_train_treated.shape,
+      "| missing values for Phase 2 to impute:", X_train_treated.isna().sum().sum())
+
+
+# ----- 7.4 Before/after boxplot of the most affected sensor -----
+# The boxplot is only a picture: its whiskers follow the usual 1.5 x IQR drawing
+# convention, while outliers were detected with the 3 sigma bounds (dashed lines).
+example_sensor = flags_per_column.idxmax()
+values_before = X_train_reduced[example_sensor].dropna()
+values_after = X_train_treated[example_sensor].dropna()
+figure, axis = plt.subplots(figsize=(7, 4))
+axis.boxplot([values_before, values_after],
+             tick_labels=["Before", "After (" + OUTLIER_TREATMENT + ")"])
+axis.axhline(lower_bounds[example_sensor], linestyle="--", linewidth=1, color=COLOR_REFERENCE)
+axis.axhline(upper_bounds[example_sensor], linestyle="--", linewidth=1, color=COLOR_REFERENCE)
+axis.text(2.45, upper_bounds[example_sensor], "+3 sigma", va="bottom", ha="right", color=COLOR_REFERENCE)
+axis.text(2.45, lower_bounds[example_sensor], "-3 sigma", va="top", ha="right", color=COLOR_REFERENCE)
+axis.set_ylabel(example_sensor + " value")
+axis.set_title(example_sensor + ": " + str(flags_per_column[example_sensor])
+               + " flagged values, before and after treatment (training set)")
+axis.spines["top"].set_visible(False)
+axis.spines["right"].set_visible(False)
+save_figure(figure, "block7_01_outlier_boxplot_" + example_sensor + ".png")
 
 # %% Block 8: Scaling and kNN imputation
 # Scale the features, then fill missing values with kNN imputation fitted on the training set (Phase 2).
