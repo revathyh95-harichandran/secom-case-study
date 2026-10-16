@@ -126,6 +126,10 @@ TEST_SIZE = 0.2
 URL_SENSOR_DATA = "https://archive.ics.uci.edu/ml/machine-learning-databases/secom/secom.data"
 URL_LABELS = "https://archive.ics.uci.edu/ml/machine-learning-databases/secom/secom_labels.data"
 
+# Number of wafers documented by UCI and the manual (Section 2.1); Block 2 checks
+# that both downloaded files have exactly this many rows.
+EXPECTED_ROWS = 1567
+
 # Find the project folder from the script's own location, so that the paths
 # work on every laptop. __file__ is the path of this script (inside src), so the
 # project folder is one level up. In VS Code's interactive window __file__ does
@@ -148,21 +152,81 @@ print("Figures are saved to:", FIGURES_FOLDER)
 print("Tables are saved to: ", TABLES_FOLDER)
 
 
-# %% Block 2: Download the data
-# Reads both original files directly from the UCI repository at runtime, because
-# the professor requires the script to download the data itself (manual p. 4,
-# slide 7). Column names, label coding and time stamps follow in Phase 1.
+# %% Block 2: Download and prepare the data
+# Reads both original files directly from the UCI repository at runtime with
+# pandas (team decision D1), because the professor requires the script to
+# download the data itself (manual p. 4, slide 7). Then names the columns,
+# parses the time stamps, recodes the label to fail = 1 / pass = 0 (decision D2)
+# and keeps features (X) and target (y) as separate objects (manual Section 2.1).
+# Nothing is removed or changed in the sensor values here.
 
-# Both files separate values with a single space (sep=" "; the pandas default
-# would be a comma) and have no header row (header=None; by default pandas would
-# use the first wafer as column names). pandas reads the text "NaN" as a missing
-# value by default; missing values are flagged explicitly in Phase 1.
-sensor_data = pd.read_csv(URL_SENSOR_DATA, sep=" ", header=None)
-labels = pd.read_csv(URL_LABELS, sep=" ", header=None)
+# Read the sensor readings. Values are separated by a single space (sep=" ";
+# the pandas default would be a comma) and there is no header row (header=None;
+# by default pandas would use the first wafer as column names).
+# na_values=["NaN"] states explicitly that the text "NaN" marks a missing
+# reading, so every gap becomes a real missing value (rule 5) instead of
+# relying silently on pandas' default list of missing-value markers.
+sensor_data = pd.read_csv(URL_SENSOR_DATA, sep=" ", header=None, na_values=["NaN"])
 
-# Expected: (1567, 590) for the sensors and (1567, 2) for label and time stamp.
-print("Sensor data shape:", sensor_data.shape)
-print("Labels shape:     ", labels.shape)
+# Read the labels file: column 1 is the label, column 2 the test date and time.
+# names= gives the two columns their names directly. The date-time contains a
+# space but stays one field, because it is written in double quotes and '"' is
+# pandas' default quote character.
+labels = pd.read_csv(URL_LABELS, sep=" ", header=None, names=["target", "timestamp"])
+
+# Check that both files describe the same 1567 wafers. The files have no wafer
+# ID: row i of the labels belongs to row i of the sensors, so a different row
+# count would mean the two files no longer match. The script stops in that case.
+print("Rows in sensor file:", len(sensor_data), "| rows in labels file:", len(labels))
+if len(sensor_data) != EXPECTED_ROWS or len(labels) != EXPECTED_ROWS:
+    raise ValueError("Expected " + str(EXPECTED_ROWS) + " rows in both files.")
+
+# Name the columns sensor_0 to sensor_589, so every sensor keeps a traceable name
+# through all later steps (manual Checklist 2.1). The loop builds one name per
+# column; range(n) counts from 0 to n - 1.
+sensor_names = []
+for column_number in range(sensor_data.shape[1]):
+    sensor_names.append("sensor_" + str(column_number))
+sensor_data.columns = sensor_names
+print("Columns:", len(sensor_names), "from", sensor_names[0], "to", sensor_names[-1])
+
+# Turn the time stamps from text into real dates (decision D3: parse and explore).
+# The file writes day/month/year (for example "19/07/2008 11:55:00"), so the
+# format is given explicitly: without it, a date such as 01/08/2008 could be read
+# as 8 January instead of 1 August. A value in any other format raises an error.
+labels["timestamp"] = pd.to_datetime(labels["timestamp"], format="%d/%m/%Y %H:%M:%S")
+print("Test dates from", labels["timestamp"].min(), "to", labels["timestamp"].max())
+
+# Recode the label (decision D2): UCI uses -1 = pass and 1 = fail; scikit-learn
+# treats 1 as the positive class, so pass becomes 0 and fail stays 1.
+counts_before = labels["target"].value_counts()
+print("Label counts before recoding (-1 = pass, 1 = fail):")
+print(counts_before)
+
+# map() replaces each value using the dictionary. Any value not in the
+# dictionary would become missing, so zero missing values afterwards proves that
+# the file contained only -1 and 1.
+labels["target"] = labels["target"].map({-1: 0, 1: 1})
+if labels["target"].isna().sum() != 0:
+    raise ValueError("The labels file contains values other than -1 and 1.")
+
+counts_after = labels["target"].value_counts()
+print("Label counts after recoding (0 = pass, 1 = fail):")
+print(counts_after)
+
+# Proof of correct recoding: every former -1 must now be 0, every 1 must still be 1.
+if counts_before[-1] != counts_after[0] or counts_before[1] != counts_after[1]:
+    raise ValueError("Label counts changed during recoding.")
+print("Recoding check passed: pass", counts_before[-1], "->", counts_after[0],
+      "| fail", counts_before[1], "->", counts_after[1])
+
+# Keep features and target as separate objects (manual 2.1): X holds only what a
+# model may use, y what it must predict, so the label can never slip into the
+# features by accident. The time stamps are kept separately for exploration.
+X = sensor_data
+y = labels["target"]
+timestamps = labels["timestamp"]
+print("X shape:", X.shape, "| y shape:", y.shape)
 
 
 # %% Block 3: Data understanding
