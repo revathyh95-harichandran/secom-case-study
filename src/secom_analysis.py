@@ -131,6 +131,10 @@ TEST_SIZE = 0.2
 # 61.2 %, including the papers' 55 %, removes exactly the same 24 columns.
 MISSING_THRESHOLD = 60
 
+# Correlation limit used only to COUNT strongly correlated pairs (|r| > 0.8, the
+# value in manual 4.6 and the papers). No column is removed because of it.
+CORRELATION_LIMIT = 0.8
+
 # Download links of the two original files in the UCI repository (dataset 179).
 URL_SENSOR_DATA = "https://archive.ics.uci.edu/ml/machine-learning-databases/secom/secom.data"
 URL_LABELS = "https://archive.ics.uci.edu/ml/machine-learning-databases/secom/secom_labels.data"
@@ -383,6 +387,54 @@ def plot_missing_pareto(missing_percent_per_column, title, file_name):
                          "columns_removed": columns_removed})
 
 
+def find_strong_pairs(correlation_matrix, limit):
+    """
+    List every pair of columns whose absolute correlation is above a limit.
+    The loop visits each pair once (j starts after i, so a column is never
+    paired with itself); a missing r (not enough shared wafers) never counts.
+
+    Input:  correlation_matrix (DataFrame: square matrix of r values), limit (float, e.g. 0.8)
+    Output: DataFrame with sensor_a, sensor_b and r, strongest first
+    """
+    column_names = correlation_matrix.columns
+    r_values = correlation_matrix.values
+    pair_rows = []
+    for i in range(len(column_names)):
+        for j in range(i + 1, len(column_names)):
+            if abs(r_values[i, j]) > limit:
+                pair_rows.append({"sensor_a": column_names[i],
+                                  "sensor_b": column_names[j],
+                                  "r": round(r_values[i, j], 4)})
+    strong_pairs_table = pd.DataFrame(pair_rows, columns=["sensor_a", "sensor_b", "r"])
+    # Sort by the size of r, ignoring its sign (key=abs), largest first.
+    strong_pairs_table = strong_pairs_table.sort_values("r", key=abs, ascending=False)
+    return strong_pairs_table.reset_index(drop=True)
+
+
+def plot_correlation_heatmap(correlation_matrix, title, file_name):
+    """
+    Draw a correlation matrix as a heatmap and save it. Diverging colours:
+    blue = negative, white = 0, red = positive, fixed from -1 to +1 so colours
+    mean the same in every heatmap; pairs without an r are light grey.
+
+    Input:  correlation_matrix (DataFrame: square matrix of r values), title (str), file_name (str)
+    Output: none (the figure is saved)
+    """
+    heatmap_colors = plt.get_cmap("RdBu_r").copy()
+    heatmap_colors.set_bad("lightgrey")
+    figure, axis = plt.subplots(figsize=(9, 8))
+    heatmap_image = axis.imshow(correlation_matrix.values, cmap=heatmap_colors, vmin=-1, vmax=1)
+    colour_bar = figure.colorbar(heatmap_image, ax=axis, shrink=0.8)
+    colour_bar.set_label("Pearson correlation r")
+    # Hundreds of sensor names cannot be read, so the tick labels are hidden.
+    axis.set_xticks([])
+    axis.set_yticks([])
+    axis.set_xlabel("Sensor columns (" + str(len(correlation_matrix.columns)) + ", original order)")
+    axis.set_ylabel("Sensor columns")
+    axis.set_title(title)
+    save_figure(figure, file_name)
+
+
 # ----- 3.1 Structure: shape, data types, duplicated rows (manual 2.2) -----
 print("\n--- 3.1 Structure ---")
 print("Shape of X (wafers, sensors):", X.shape)
@@ -586,33 +638,15 @@ print("\n--- 3.9 Correlation heatmap ---")
 non_constant_columns = column_variances[column_variances > 0].index
 correlation_matrix = X[non_constant_columns].corr()
 
-# Count the pairs with |r| >= 0.8 (the papers' removal rule, reported only).
-# The loop visits each pair once (j starts after i); missing r values count as no.
-absolute_correlations = correlation_matrix.abs().values
-number_of_columns = len(non_constant_columns)
-strong_pairs = 0
-for i in range(number_of_columns):
-    for j in range(i + 1, number_of_columns):
-        if absolute_correlations[i, j] >= 0.8:
-            strong_pairs = strong_pairs + 1
-print("Non-constant columns in the heatmap:", number_of_columns)
-print("Pairs with |r| >= 0.8:", strong_pairs)
-
-# Diverging colours: blue = negative, white = 0, red = positive, fixed from -1
-# to +1 so colours mean the same in every heatmap. Pairs without enough data
-# (no r) are shown in light grey via set_bad().
-heatmap_colors = plt.get_cmap("RdBu_r").copy()
-heatmap_colors.set_bad("lightgrey")
-figure, axis = plt.subplots(figsize=(9, 8))
-heatmap_image = axis.imshow(correlation_matrix.values, cmap=heatmap_colors, vmin=-1, vmax=1)
-colour_bar = figure.colorbar(heatmap_image, ax=axis, shrink=0.8)
-colour_bar.set_label("Pearson correlation r")
-axis.set_xticks([])
-axis.set_yticks([])
-axis.set_xlabel("Sensor columns (" + str(number_of_columns) + " non-constant, original order)")
-axis.set_ylabel("Sensor columns")
-axis.set_title("Correlation heatmap, full data (" + str(strong_pairs) + " pairs with |r| >= 0.8)")
-save_figure(figure, "block3_08_correlation_heatmap.png")
+# Pairs with |r| > CORRELATION_LIMIT (the papers' removal rule, reported only),
+# then the heatmap (functions above).
+strong_pairs_full = find_strong_pairs(correlation_matrix, CORRELATION_LIMIT)
+print("Non-constant columns in the heatmap:", len(non_constant_columns))
+print("Pairs with |r| >", CORRELATION_LIMIT, ":", len(strong_pairs_full))
+plot_correlation_heatmap(correlation_matrix,
+                         "Correlation heatmap, full data (" + str(len(strong_pairs_full))
+                         + " pairs with |r| > " + str(CORRELATION_LIMIT) + ")",
+                         "block3_08_correlation_heatmap.png")
 
 # %% Block 4: Stratified train/test split
 # Splits the wafers into 80 % training and 20 % test data BEFORE any cleaning,
@@ -823,8 +857,38 @@ pd.DataFrame(removed_reasons).to_csv(TABLES_FOLDER / "block5_removed_columns.csv
 print("Columns removed in total:", len(columns_removed_in_block5),
       "| remaining training columns:", X_train_reduced.shape[1])
 
-# %% Block 6: Correlation heatmap
-# Visualise correlations between the remaining sensors, without removing any (Phase 1).
+# %% Block 6: Correlation analysis on the training set (visualise only)
+# Shows how strongly the 450 remaining training columns move together (manual
+# Section 4.6). Unlike Munirathinam and Ramadoss (2016), who dropped one sensor
+# of every pair with |r| >= 0.8, NO column is removed here: without a measure of
+# which sensor predicts failure better, the choice would be arbitrary. Redundancy
+# is handled later by Boruta (Block 10), which uses the label.
+print("\n--- 6.1 Correlation analysis (training set) ---")
+
+# Pearson correlation between every pair of remaining training columns. pandas'
+# corr() uses method="pearson" by default and, for each pair, only the wafers
+# where both values exist (pairwise deletion).
+correlation_matrix_train = X_train_reduced.corr()
+
+# Pairs above the limit, strongest first; saved as a table, nothing removed.
+strong_pairs_train = find_strong_pairs(correlation_matrix_train, CORRELATION_LIMIT)
+strong_pairs_train.to_csv(TABLES_FOLDER / "block6_strong_correlation_pairs.csv", index=False)
+total_pairs = len(correlation_matrix_train.columns) * (len(correlation_matrix_train.columns) - 1) // 2
+print("Columns:", len(correlation_matrix_train.columns), "| pairs in total:", total_pairs)
+print("Pairs with |r| >", CORRELATION_LIMIT, ":", len(strong_pairs_train),
+      "(", round(len(strong_pairs_train) / total_pairs * 100, 2), "% of all pairs )")
+
+# How many different columns appear in at least one strong pair.
+columns_in_strong_pairs = set(strong_pairs_train["sensor_a"]).union(set(strong_pairs_train["sensor_b"]))
+print("Columns involved in at least one strong pair:", len(columns_in_strong_pairs))
+print("Ten strongest pairs:")
+print(strong_pairs_train.head(10).to_string(index=False))
+
+plot_correlation_heatmap(correlation_matrix_train,
+                         "Correlation heatmap, training set (" + str(len(strong_pairs_train))
+                         + " pairs with |r| > " + str(CORRELATION_LIMIT) + ", none removed)",
+                         "block6_01_correlation_heatmap_train.png")
+print("No columns removed; training columns remain:", X_train_reduced.shape[1])
 
 # %% Block 7: Outliers (3 sigma rule)
 # Detect outliers with the 3 sigma rule and apply the chosen treatment (Phase 1).
