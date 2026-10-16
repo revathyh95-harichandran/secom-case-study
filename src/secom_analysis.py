@@ -101,11 +101,12 @@ else:
     print("All", len(REQUIRED_PACKAGES), "packages already have the right versions.")
 
 # Imports used by the blocks written so far. Later blocks add their imports
-# (scikit-learn, imbalanced-learn, Boruta) when first needed.
+# (more of scikit-learn, imbalanced-learn, Boruta) when first needed.
 from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
 
 
 # %% Block 1: Settings
@@ -552,7 +553,80 @@ axis.set_title("Correlation heatmap, full data (" + str(strong_pairs) + " pairs 
 save_figure(figure, "block3_08_correlation_heatmap.png")
 
 # %% Block 4: Stratified train/test split
-# Stratified 80/20 split with SEED, and a check of the class shares (Phase 1).
+# Splits the wafers into 80 % training and 20 % test data BEFORE any cleaning,
+# so that no rule learned later can be influenced by the test wafers (manual
+# Section 3, rule 1). Stratified on the label, because with only 104 failures a
+# purely random split could put noticeably more or fewer of them in the test set.
+
+# test_size=TEST_SIZE (0.2) puts 20 % of the wafers in the test set.
+# stratify=y draws 20 % from the pass wafers and 20 % from the fail wafers
+# separately, so both sets keep the failure share of the full data.
+# random_state=SEED fixes the random draw, so the split is identical on every run
+# and every laptop. shuffle=True (default) mixes the wafers first, which matters
+# because the files are ordered by test date.
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=TEST_SIZE, stratify=y, random_state=SEED
+)
+
+# Checks: the two sets together contain every wafer exactly once, and X and y
+# still belong together. The index keeps each wafer's original row number, so
+# overlap can be checked directly.
+print("\n--- 4.1 Split sizes ---")
+print("Training set:", X_train.shape, "| test set:", X_test.shape)
+wafers_in_both = X_train.index.intersection(X_test.index)
+if len(X_train) + len(X_test) != len(X) or len(wafers_in_both) != 0:
+    raise ValueError("The split lost, duplicated or shared wafers.")
+if not X_train.index.equals(y_train.index) or not X_test.index.equals(y_test.index):
+    raise ValueError("X and y rows do not match after the split.")
+print("Check passed: every wafer is in exactly one set, X and y match.")
+
+# Class counts and percentages in the full data, training set and test set
+# ("before and after splitting", manual 3.3).
+print("\n--- 4.2 Class shares before and after splitting ---")
+set_names = ["Full data", "Training set", "Test set"]
+set_targets = [y, y_train, y_test]
+split_rows = []
+for position in range(len(set_names)):
+    target = set_targets[position]
+    failures = int(target.sum())
+    passes = len(target) - failures
+    split_rows.append({"set": set_names[position],
+                       "wafers": len(target),
+                       "pass": passes,
+                       "fail": failures,
+                       "percent_pass": round(passes / len(target) * 100, 2),
+                       "percent_fail": round(failures / len(target) * 100, 2)})
+split_table = pd.DataFrame(split_rows)
+print(split_table.to_string(index=False))
+split_table.to_csv(TABLES_FOLDER / "block4_split_proportions.csv", index=False)
+
+# Bar chart of the failure share in the three sets, each bar labelled with its
+# percentage and number of failures.
+figure, axis = plt.subplots(figsize=(7, 4))
+axis.bar(split_table["set"], split_table["percent_fail"], color=COLOR_FAIL, width=0.6)
+for position in range(len(split_table)):
+    bar_label = (str(split_table["percent_fail"][position]) + " %\n("
+                 + str(split_table["fail"][position]) + " of "
+                 + str(split_table["wafers"][position]) + ")")
+    axis.text(position, split_table["percent_fail"][position], bar_label,
+              ha="center", va="bottom")
+axis.set_ylim(0, split_table["percent_fail"].max() * 1.35)
+axis.set_ylabel("Failed wafers (%)")
+axis.set_title("Failure share before and after the stratified 80/20 split")
+axis.spines["top"].set_visible(False)
+axis.spines["right"].set_visible(False)
+save_figure(figure, "block4_01_failure_share_split.png")
+
+# ---------------------------------------------------------------------------
+# THE TEST SET IS NOW LOCKED (manual 3.4, rules 1, 2 and 7).
+# From here on:
+# - every rule (columns removed, thresholds, outlier bounds, scaling, imputation,
+#   selected features, balancing, model, hyperparameters, decision threshold)
+#   is learned from X_train / y_train only, and stored in a variable;
+# - X_test is only used to APPLY those stored rules, at the final evaluation
+#   (Block 17); nothing is ever fitted on it;
+# - y_test is not used at all before Block 17.
+# ---------------------------------------------------------------------------
 
 # %% Block 5: Rough feature reduction
 # Remove constant, duplicate and very incomplete columns on the training set, mirrored to the test set (Phase 1).

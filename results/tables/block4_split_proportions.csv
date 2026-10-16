@@ -1,0 +1,4 @@
+set,wafers,pass,fail,percent_pass,percent_fail
+Full data,1567,1463,104,93.36,6.64
+Training set,1253,1170,83,93.38,6.62
+Test set,314,293,21,93.31,6.69
