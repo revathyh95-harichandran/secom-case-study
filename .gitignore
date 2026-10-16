@@ -30,6 +30,7 @@ data/
 # Papers, professor's templates, slides and the team zip
 *.pdf
 *.pptx
+*.potx
 *.docx
 *.zip
 
