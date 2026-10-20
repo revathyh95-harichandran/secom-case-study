@@ -51,18 +51,43 @@ so that it does not change package versions of another Python installation.
 2. Open the project folder (**File → Open Folder**).
 3. Press **Ctrl+Shift+P** (Mac: **Cmd+Shift+P**), choose
    **Python: Select Interpreter** and select the one in `.venv`.
-4. Open `src/secom_analysis.py` and click **Run Python File** (▶, top right).
+4. Open the script of the phase you want to run (see below) and click
+   **Run Python File** (▶, top right).
 
-The script is divided into numbered blocks starting with `# %%`. They can also be
+There is one complete script per phase. Each one contains all earlier steps, so
+it runs on its own, starting from the download:
+
+| Script | Blocks | Content |
+| --- | --- | --- |
+| `src/phase1_secom_analysis.py` | 0 to 7 | Download, data understanding, stratified split, feature reduction, correlation, outliers |
+| `src/phase2_secom_analysis.py` | 0 to 12 | Phase 1 plus scaling, kNN imputation, first model, Boruta, balancing (added in Phase 2) |
+| `src/phase3_secom_analysis.py` | 0 to 18 | The complete pipeline up to the final test (added in Phase 3) |
+
+Each script is divided into numbered blocks starting with `# %%`. They can also be
 run one at a time with **Run Cell**; VS Code then asks to install the `ipykernel`
 package once, which is only needed for this interactive mode.
 
 ## Outputs
 - Figures: `results/figures/`
 - Tables: `results/tables/`
+- Raw data: `data/raw/` – the two files exactly as downloaded from UCI (rewritten on every run)
+- Processed data: `data/processed/` – every prepared version of the data as CSV,
+  named after the block that produced it (for example `block5_train_reduced.csv`)
 
-Both folders are created by the script if they do not exist. The data itself is
-never saved.
+All folders are created by the script if they do not exist. The data is always
+read from the download itself, never from a local copy. The `data/` folder is
+not part of this repository.
+
+```
+data/
+  raw/         secom.data, secom_labels.data
+  processed/   block2_secom_labelled.csv, block4_train_split.csv, block4_test_split.csv,
+               block5_train_reduced.csv, block7_train_capped.csv
+src/
+  phase1_secom_analysis.py, phase2_secom_analysis.py, phase3_secom_analysis.py
+results/
+  figures/, tables/
+```
 
 ## Data
 McCann, M. and Johnston, A. (2008). SECOM [Dataset]. UCI Machine Learning

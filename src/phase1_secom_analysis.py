@@ -1,5 +1,9 @@
 # %% Block 0: Header, package installation and imports
-# SECOM wafer fault prediction
+# SECOM wafer fault prediction - PHASE 1 SCRIPT (Part A, Presentation 1)
+# Blocks 0 to 7: installation, settings, data download, data understanding,
+# stratified split, feature reduction, correlation and outliers. Each phase has
+# its own complete script (phase1, phase2, phase3); every script runs on its own
+# from the download onwards, so it can be submitted and run without the others.
 # Case study for Advanced Data Analytics and Computational Methods (MPMD, HTW Berlin)
 # Team: Revathy Harichandran, Varshini, Gul
 #
@@ -10,7 +14,9 @@
 #
 # Data: McCann, M. and Johnston, A. (2008). SECOM [Dataset]. UCI Machine
 # Learning Repository, CC BY 4.0. https://doi.org/10.24432/C54305
-# The data is downloaded from UCI every time the script runs; no local copy is used.
+# The data is downloaded from UCI every time the script runs; no local copy is
+# read. The downloaded files are saved unchanged in data/raw, and every prepared
+# version of the data is saved in data/processed (neither folder is on GitHub).
 #
 # How to run: open this file in Visual Studio Code and click "Run Python File",
 # or run it block by block with the "# %%" cells. The script installs its own
@@ -102,6 +108,8 @@ else:
 
 # Imports used by the blocks written so far. Later blocks add their imports
 # (more of scikit-learn, imbalanced-learn, Boruta) when first needed.
+import io
+import urllib.request
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -169,8 +177,18 @@ TABLES_FOLDER = PROJECT_FOLDER / "results" / "tables"
 FIGURES_FOLDER.mkdir(parents=True, exist_ok=True)
 TABLES_FOLDER.mkdir(parents=True, exist_ok=True)
 
+# Data folders (standard practice): data/raw keeps the downloaded files exactly
+# as published, data/processed keeps every prepared version of the data. Both
+# are created if missing and are excluded from GitHub by .gitignore.
+RAW_DATA_FOLDER = PROJECT_FOLDER / "data" / "raw"
+PROCESSED_DATA_FOLDER = PROJECT_FOLDER / "data" / "processed"
+RAW_DATA_FOLDER.mkdir(parents=True, exist_ok=True)
+PROCESSED_DATA_FOLDER.mkdir(parents=True, exist_ok=True)
+
 print("Figures are saved to:", FIGURES_FOLDER)
 print("Tables are saved to: ", TABLES_FOLDER)
+print("Raw data is saved to:", RAW_DATA_FOLDER)
+print("Processed data is saved to:", PROCESSED_DATA_FOLDER)
 
 # Colours used in every figure, defined once so all charts look the same.
 # Blue and orange are a colour-blind-safe pair; grey is for reference lines.
@@ -186,21 +204,64 @@ COLOR_REFERENCE = "#52514e"
 # download the data itself (manual p. 4, slide 7). Then names the columns,
 # parses the time stamps, recodes the label to fail = 1 / pass = 0 (decision D2)
 # and keeps features (X) and target (y) as separate objects (manual Section 2.1).
-# Nothing is removed or changed in the sensor values here.
+# Nothing is removed or changed in the sensor values here. The two downloaded
+# files are saved unchanged in data/raw; the prepared data is saved in data/processed.
 
-# Read the sensor readings. Values are separated by a single space (sep=" ";
-# the pandas default would be a comma) and there is no header row (header=None;
-# by default pandas would use the first wafer as column names).
+
+def download_file(url, raw_file_name):
+    """
+    Download a file from the internet and save its bytes unchanged in data/raw.
+
+    Input:  url (str: web address of the file), raw_file_name (str: name in data/raw)
+    Output: the downloaded bytes (so the data is read from the download itself,
+            never from a local copy)
+    """
+    # urlopen() requests the file; read() returns its exact bytes. timeout=60
+    # stops waiting after 60 seconds if UCI does not answer.
+    with urllib.request.urlopen(url, timeout=60) as response:
+        file_bytes = response.read()
+    # "wb" = write bytes: the raw file is byte-for-byte what UCI published and is
+    # rewritten on every run, so it always matches the current download.
+    with open(RAW_DATA_FOLDER / raw_file_name, "wb") as raw_file:
+        raw_file.write(file_bytes)
+    print("Downloaded", len(file_bytes), "bytes and saved", RAW_DATA_FOLDER / raw_file_name)
+    return file_bytes
+
+
+def save_processed(features, target, file_name):
+    """
+    Save a prepared version of the data as a CSV file in data/processed.
+
+    Input:  features (DataFrame), target (Series with the label, same rows as features),
+            file_name (str, for example "block4_train_split.csv")
+    Output: none (the file is written and its path printed)
+    """
+    # Copy so the features in memory are not changed; add the label as the last column.
+    table = features.copy()
+    table["target"] = target
+    # index_label="wafer_id" stores each wafer's original row number, so every
+    # row can be traced back to the raw files.
+    table.to_csv(PROCESSED_DATA_FOLDER / file_name, index_label="wafer_id")
+    print("Saved processed data:", PROCESSED_DATA_FOLDER / file_name, table.shape)
+
+
+sensor_bytes = download_file(URL_SENSOR_DATA, "secom.data")
+label_bytes = download_file(URL_LABELS, "secom_labels.data")
+
+# Read the sensor readings from the downloaded bytes (io.BytesIO lets pandas read
+# bytes in memory as if they were a file). Values are separated by a single
+# space (sep=" "; the pandas default would be a comma) and there is no header
+# row (header=None; by default pandas would use the first wafer as column names).
 # na_values=["NaN"] states explicitly that the text "NaN" marks a missing
 # reading, so every gap becomes a real missing value (rule 5) instead of
 # relying silently on pandas' default list of missing-value markers.
-sensor_data = pd.read_csv(URL_SENSOR_DATA, sep=" ", header=None, na_values=["NaN"])
+sensor_data = pd.read_csv(io.BytesIO(sensor_bytes), sep=" ", header=None, na_values=["NaN"])
 
 # Read the labels file: column 1 is the label, column 2 the test date and time.
 # names= gives the two columns their names directly. The date-time contains a
 # space but stays one field, because it is written in double quotes and '"' is
 # pandas' default quote character.
-labels = pd.read_csv(URL_LABELS, sep=" ", header=None, names=["target", "timestamp"])
+labels = pd.read_csv(io.BytesIO(label_bytes), sep=" ", header=None, names=["target", "timestamp"])
 
 # Check that both files describe the same 1567 wafers. The files have no wafer
 # ID: row i of the labels belongs to row i of the sensors, so a different row
@@ -255,6 +316,12 @@ X = sensor_data
 y = labels["target"]
 timestamps = labels["timestamp"]
 print("X shape:", X.shape, "| y shape:", y.shape)
+
+# Processed data, step 1: the full labelled data (named sensors, recoded target)
+# plus the parsed time stamp, before any split or cleaning.
+X_with_timestamp = X.copy()
+X_with_timestamp["timestamp"] = timestamps
+save_processed(X_with_timestamp, y, "block2_secom_labelled.csv")
 
 
 # %% Block 3: Data understanding (descriptive analysis of the full data)
@@ -684,6 +751,11 @@ if not X_train.index.equals(y_train.index) or not X_test.index.equals(y_test.ind
     raise ValueError("X and y rows do not match after the split.")
 print("Check passed: every wafer is in exactly one set, X and y match.")
 
+# Processed data: both sets straight after the split. The test set file is only
+# a stored copy of the locked test wafers; nothing is learned from it.
+save_processed(X_train, y_train, "block4_train_split.csv")
+save_processed(X_test, y_test, "block4_test_split.csv")
+
 # Class counts and percentages in the full data, training set and test set
 # ("before and after splitting", manual 3.3).
 print("\n--- 4.2 Class shares before and after splitting ---")
@@ -865,6 +937,9 @@ pd.DataFrame(removed_reasons).to_csv(TABLES_FOLDER / "block5_removed_columns.csv
 print("Columns removed in total:", len(columns_removed_in_block5),
       "| remaining training columns:", X_train_reduced.shape[1])
 
+# Processed data: the training set after the feature reduction (450 columns).
+save_processed(X_train_reduced, y_train, "block5_train_reduced.csv")
+
 # %% Block 6: Correlation analysis on the training set (visualise only)
 # Shows how strongly the 450 remaining training columns move together (manual
 # Section 4.6). Unlike Munirathinam and Ramadoss (2016), who dropped one sensor
@@ -1038,6 +1113,9 @@ X_train_treated = apply_outlier_treatment(OUTLIER_TREATMENT, X_train_reduced, lo
 print("Chosen treatment:", OUTLIER_TREATMENT, "| training shape:", X_train_treated.shape,
       "| missing values for Phase 2 to impute:", X_train_treated.isna().sum().sum())
 
+# Processed data: the training set after outlier capping, the input for Phase 2.
+save_processed(X_train_treated, y_train, "block7_train_capped.csv")
+
 
 # ----- 7.4 Before/after boxplot of the most affected sensor -----
 # The boxplot is only a picture: its whiskers follow the usual 1.5 x IQR drawing
@@ -1059,35 +1137,8 @@ axis.spines["top"].set_visible(False)
 axis.spines["right"].set_visible(False)
 save_figure(figure, "block7_01_outlier_boxplot_" + example_sensor + ".png")
 
-# %% Block 8: Scaling and kNN imputation
-# Scale the features, then fill missing values with kNN imputation fitted on the training set (Phase 2).
-
-# %% Block 9: First random forest
-# Train a first random forest and report its metrics (Phase 2).
-
-# %% Block 10: Boruta feature selection
-# Select the informative sensors with Boruta on the training set (Phase 2).
-
-# %% Block 11: Balancing
-# Balance the training set with SMOTE or ROSE; the test set is never balanced (Phase 2).
-
-# %% Block 12: Evaluation helpers
-# Functions for the confusion matrix, metrics, ROC curve and total cost (Phase 2).
-
-# %% Block 13: Full pipeline
-# Put all preprocessing and the model into one pipeline to avoid leakage in cross-validation (Phase 3).
-
-# %% Block 14: Model comparison
-# Compare the random forest with at least one other model using stratified cross-validation (Phase 3).
-
-# %% Block 15: Grid search
-# Tune the settings of preprocessing and models with a small grid search (Phase 3).
-
-# %% Block 16: Threshold and cost optimisation
-# Choose the decision threshold with the lowest cost on cross-validated training predictions (Phase 3).
-
-# %% Block 17: Final evaluation on the test set
-# Evaluate the chosen model once on the untouched test set (Phase 3).
-
-# %% Block 18: Save results and summary
-# Save all tables and figures and print a summary of the results (Phase 3).
+# End of Phase 1. Blocks 8 to 12 (scaling, kNN imputation, first model, Boruta,
+# balancing, evaluation) follow in phase2_secom_analysis.py, and Blocks 13 to 18
+# (pipeline, model comparison, grid search, threshold, final test) in
+# phase3_secom_analysis.py.
+print("\nPhase 1 finished.")
