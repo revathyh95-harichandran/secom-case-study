@@ -1,0 +1,2 @@
+ensemble,mean_average_precision,best_single,best_single_average_precision,mean_difference,std_of_differences,kept
+soft vote of easy_ensemble + none | random_forest + ROSE | balanced_random_forest + none,0.2803,easy_ensemble + none,0.2715,0.0087,0.0715,False

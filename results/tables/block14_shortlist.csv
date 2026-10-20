@@ -1,0 +1,6 @@
+combination,family,balancing,mean_average_precision,std_average_precision,ROC_AUC,mean_recall_at_0.5,TP_at_0.5,FP_at_0.5,cost_at_0.5,std_cost_per_fold
+easy_ensemble + none,easy_ensemble,none,0.2715,0.0574,0.7877,0.7118,59,356,191200,6465.9
+random_forest + ROSE,random_forest,ROSE,0.2512,0.0955,0.7191,0.289,24,93,313600,14899.4
+balanced_random_forest + none,balanced_random_forest,none,0.2497,0.0429,0.7584,0.5184,43,176,235200,10044.3
+gradient_boosting + none,gradient_boosting,none,0.2471,0.0531,0.771,0.072,6,10,387000,2742.3
+logistic_regression + ROSE,logistic_regression,ROSE,0.2358,0.0452,0.7365,0.6029,50,277,220400,10546.7

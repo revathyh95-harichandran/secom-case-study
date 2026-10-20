@@ -1,0 +1,3 @@
+set_up,TN,FP,FN,TP,recall,precision,F2,ROC_AUC,cost_eur
+Phase 2 chain (scaler + imputer fitted once),1068,102,58,25,0.3012,0.1969,0.2723,0.7171,310400
+Leak-proof pipeline (refitted per fold),1077,93,59,24,0.2892,0.2051,0.2673,0.7191,313600

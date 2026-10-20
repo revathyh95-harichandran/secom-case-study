@@ -1,0 +1,2343 @@
+# %% Block 0: Header, package installation and imports
+# SECOM wafer fault prediction - PHASE 3 SCRIPT (Part C, Presentation 3, final submission)
+# Blocks 0 to 7 (Phase 1, unchanged): installation, settings, data download,
+# data understanding, stratified split, feature reduction, correlation, outliers.
+# Blocks 8 to 12 (Phase 2, unchanged): missing-value check, scaling and kNN
+# imputation, first random forest, Boruta feature selection, balancing, evaluation.
+# Blocks 13 to 18 (Phase 3): leak-proof pipeline, model comparison, grid search,
+# cost-based threshold, the one-time final test, summary. Each phase has
+# its own complete script (phase1, phase2, phase3); every script runs on its own
+# from the download onwards, so it can be submitted and run without the others.
+# Case study for Advanced Data Analytics and Computational Methods (MPMD, HTW Berlin)
+# Team: Revathy Harichandran, Varshini, Gul
+#
+# Predicts which semiconductor wafers fail the final electrical test from
+# 590 sensor readings, following CRISP-DM and the SECOM Case Study Manual.
+# The best model is chosen by total cost: 200 euros per false positive and
+# 5,000 euros per false negative.
+#
+# Data: McCann, M. and Johnston, A. (2008). SECOM [Dataset]. UCI Machine
+# Learning Repository, CC BY 4.0. https://doi.org/10.24432/C54305
+# The data is downloaded from UCI every time the script runs; no local copy is
+# read. The downloaded files are saved unchanged in data/raw, and every prepared
+# version of the data is saved in data/processed (neither folder is on GitHub).
+#
+# How to run: open this file in Visual Studio Code and click "Run Python File",
+# or run it block by block with the "# %%" cells. The script installs its own
+# packages (below), so it reproduces every result without any modification.
+#
+# This block installs the exact package versions the team uses, because the
+# professor requires the script to install its own packages (manual p. 4, slide 7)
+# and identical versions give identical results on every computer.
+
+# Standard-library modules: they come with Python, so they never need installing.
+import sys
+import subprocess
+import importlib
+import importlib.metadata
+
+# Stop early with a clear message on Python older than 3.12, because the pinned
+# numpy 2.5.4 and scipy 1.18.1 cannot be installed there (pip would fail with a
+# long, confusing error instead). The team uses Python 3.14.
+if sys.version_info < (3, 12):
+    print("This script needs Python 3.12 or newer. You are using Python", sys.version.split()[0])
+    sys.exit(1)
+
+# Exact versions, copied from requirements.txt. They are written here as well
+# because the professor receives only this script, not requirements.txt.
+# If requirements.txt changes, this list must be changed in the same way.
+REQUIRED_PACKAGES = {
+    "Boruta": "0.4.3",
+    "cloudpickle": "3.1.2",
+    "contourpy": "1.4.0",
+    "cycler": "0.12.1",
+    "fonttools": "4.67.0",
+    "imbalanced-learn": "0.14.2",
+    "joblib": "1.6.0",
+    "kiwisolver": "1.5.1",
+    "matplotlib": "3.11.2",
+    "narwhals": "2.27.1",
+    "numpy": "2.5.4",
+    "packaging": "26.3",
+    "pandas": "3.0.6",
+    "pillow": "12.3.0",
+    "pyparsing": "3.3.3",
+    "python-dateutil": "2.9.0.post0",
+    "scikit-learn": "1.9.1",
+    "scipy": "1.18.1",
+    "six": "1.17.0",
+    "sklearn-compat": "0.1.6",
+    "threadpoolctl": "3.7.0",
+    "tzdata": "2026.5",
+}
+
+
+def find_packages_to_install(required_packages):
+    """
+    Compare the installed version of every required package with the pinned version.
+
+    Input:  required_packages (dict: package name -> exact version)
+    Output: list of "name==version" strings for every package that is missing
+            or installed in a different version
+    """
+    packages_to_install = []
+    for package_name, required_version in required_packages.items():
+        # version() reads the installed version from the package's metadata,
+        # without importing the package. It raises PackageNotFoundError if the
+        # package is not installed at all.
+        try:
+            installed_version = importlib.metadata.version(package_name)
+        except importlib.metadata.PackageNotFoundError:
+            installed_version = None
+
+        # A missing package and a different version both need installing.
+        if installed_version != required_version:
+            packages_to_install.append(package_name + "==" + required_version)
+    return packages_to_install
+
+
+packages_to_install = find_packages_to_install(REQUIRED_PACKAGES)
+
+if len(packages_to_install) > 0:
+    print("Installing", len(packages_to_install), "package(s):", packages_to_install)
+    # sys.executable is the Python running this script, so "-m pip" installs into
+    # exactly this Python, not into another Python on the same computer.
+    # check_call stops the script with an error if pip fails.
+    subprocess.check_call([sys.executable, "-m", "pip", "install"] + packages_to_install)
+    # Python remembers which packages existed when it started; this makes it
+    # look again, so the packages installed just now can be imported below.
+    importlib.invalidate_caches()
+else:
+    print("All", len(REQUIRED_PACKAGES), "packages already have the right versions.")
+
+# Imports used by the blocks written so far. Later blocks add their imports
+# (more of scikit-learn, imbalanced-learn, Boruta) when first needed.
+import io
+import urllib.request
+from pathlib import Path
+import numpy as np
+import pandas as pd
+# The script only saves figures to files and never opens a window, so matplotlib
+# uses the file-only "Agg" backend. The default window backend (Tk) printed
+# "main thread is not in main loop" errors when a multi-threaded step ran
+# (DEBUG_LOG.md, 20 Oct). use() must come before pyplot is imported.
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+from sklearn.model_selection import train_test_split
+# Phase 2 imports: scaling and kNN imputation (Block 8).
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.impute import KNNImputer
+# Phase 2 imports: first model and cross-validation (Block 9).
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import confusion_matrix
+# Phase 2 import: Boruta feature selection (Block 10).
+from boruta import BorutaPy
+# Phase 2 imports: balancing (Block 11).
+from imblearn.over_sampling import SMOTE, ADASYN, RandomOverSampler
+from sklearn.neighbors import NearestNeighbors
+# Phase 2 imports: evaluation (Block 12).
+from sklearn.metrics import roc_auc_score, roc_curve
+# Phase 3 imports: the leak-proof pipeline (Block 13).
+from imblearn.pipeline import Pipeline
+from sklearn.preprocessing import FunctionTransformer
+from sklearn.base import clone
+# Phase 3 imports: model comparison (Block 14).
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import HistGradientBoostingClassifier, VotingClassifier
+from sklearn.naive_bayes import GaussianNB
+from sklearn.dummy import DummyClassifier
+from sklearn.metrics import average_precision_score
+from imblearn.ensemble import BalancedRandomForestClassifier, EasyEnsembleClassifier
+
+
+# %% Block 1: Settings
+# Every fixed number and path of the project is defined here once, so it can be
+# found and changed in one place and is used identically by every later block.
+
+# Random seed, used in the split, the balancing, every model and the
+# cross-validation splitter, so that every run and every laptop gives the same results.
+SEED = 42
+
+# Cost of each error type in euros (manual Section 14.2): a false positive is a
+# good wafer wrongly flagged, a false negative is a failed wafer that is missed.
+COST_FALSE_POSITIVE = 200
+COST_FALSE_NEGATIVE = 5000
+
+# Share of wafers held back as the test set: the 80/20 split from manual Section 3.
+TEST_SIZE = 0.2
+
+# Missing-value threshold in percent (decision D5): columns with MORE missing
+# values than this in the training set are removed in Block 5. 60 % is the
+# manual's starting point; on the training set any threshold from 49.1 % to
+# 61.2 %, including the papers' 55 %, removes exactly the same 24 columns.
+MISSING_THRESHOLD = 60
+
+# Correlation limit used only to COUNT strongly correlated pairs (|r| > 0.8, the
+# value in manual 4.6 and the papers). No column is removed because of it.
+CORRELATION_LIMIT = 0.8
+
+# Outliers (manual Section 5): a value more than OUTLIER_SIGMA standard
+# deviations from its column's training mean is an outlier (3 sigma rule; the
+# IQR method is not allowed, rule 4). OUTLIER_TREATMENT (decision D7) is one of
+# "nothing", "cap" or "remove"; "cap" keeps every wafer and value but pulls
+# extreme values back to the bound. All three stay available for the grid search.
+OUTLIER_SIGMA = 3
+OUTLIER_TREATMENT = "cap"
+
+# Phase 2 setting - kNN imputation (decision D9): a gap is filled with the
+# average of the KNN_NEIGHBORS most similar training wafers. 5 is the manual's
+# required starting point; it stays a setting so the grid search can try 3 to 9.
+KNN_NEIGHBORS = 5
+
+# Phase 2 setting - cross-validation: the training set is cut into CV_FOLDS
+# parts (stratified, so each part keeps about 6.6 % failures). 5 is the manual's
+# choice and leaves about 17 failed wafers in each part to evaluate on.
+CV_FOLDS = 5
+
+# Phase 2 settings - Boruta feature selection: BORUTA_MAX_ITER is the maximum
+# number of rounds against the shadow features (100 is Boruta's default; 200
+# gave the same 15 confirmed sensors). KEEP_TENTATIVE (decision D10): True keeps
+# the tentative (borderline) sensors, as the manual's week 4 asks
+# ("including tentative ones").
+BORUTA_MAX_ITER = 100
+KEEP_TENTATIVE = True
+
+# Phase 2 settings - balancing (decision D11). BALANCING_METHOD is the working
+# choice for Phase 2 after the screening in Block 11 ("none", "class_weight",
+# "SMOTE", "ROSE" or "ADASYN"): ROSE had the lowest cross-validated cost.
+# ROSE_SHRINKAGE = 1.0 reproduces ROSE's default amount of smoothing (the noise
+# added around each copied failed wafer); 0 would mean plain copies.
+BALANCING_METHOD = "ROSE"
+ROSE_SHRINKAGE = 1.0
+
+# Download links of the two original files in the UCI repository (dataset 179).
+URL_SENSOR_DATA = "https://archive.ics.uci.edu/ml/machine-learning-databases/secom/secom.data"
+URL_LABELS = "https://archive.ics.uci.edu/ml/machine-learning-databases/secom/secom_labels.data"
+
+# Number of wafers documented by UCI and the manual (Section 2.1); Block 2 checks
+# that both downloaded files have exactly this many rows.
+EXPECTED_ROWS = 1567
+
+# Find the project folder from the script's own location, so that the paths
+# work on every laptop. __file__ is the path of this script (inside src), so the
+# project folder is one level up. In VS Code's interactive window __file__ does
+# not exist; there the working folder is the script's folder (src) by default.
+if "__file__" in globals():
+    SCRIPT_FOLDER = Path(__file__).resolve().parent
+else:
+    SCRIPT_FOLDER = Path.cwd()
+PROJECT_FOLDER = SCRIPT_FOLDER.parent
+
+# Output folders for figures and tables. mkdir creates them if they are missing
+# (for example on the professor's computer); parents=True also creates "results",
+# and exist_ok=True means no error if the folder already exists.
+FIGURES_FOLDER = PROJECT_FOLDER / "results" / "figures"
+TABLES_FOLDER = PROJECT_FOLDER / "results" / "tables"
+FIGURES_FOLDER.mkdir(parents=True, exist_ok=True)
+TABLES_FOLDER.mkdir(parents=True, exist_ok=True)
+
+# Data folders (standard practice): data/raw keeps the downloaded files exactly
+# as published, data/processed keeps every prepared version of the data. Both
+# are created if missing and are excluded from GitHub by .gitignore.
+RAW_DATA_FOLDER = PROJECT_FOLDER / "data" / "raw"
+PROCESSED_DATA_FOLDER = PROJECT_FOLDER / "data" / "processed"
+RAW_DATA_FOLDER.mkdir(parents=True, exist_ok=True)
+PROCESSED_DATA_FOLDER.mkdir(parents=True, exist_ok=True)
+
+print("Figures are saved to:", FIGURES_FOLDER)
+print("Tables are saved to: ", TABLES_FOLDER)
+print("Raw data is saved to:", RAW_DATA_FOLDER)
+print("Processed data is saved to:", PROCESSED_DATA_FOLDER)
+
+# Colours used in every figure, defined once so all charts look the same.
+# Blue and orange are a colour-blind-safe pair; grey is for reference lines.
+COLOR_PASS = "#2a78d6"
+COLOR_FAIL = "#eb6834"
+COLOR_MAIN = "#2a78d6"
+COLOR_REFERENCE = "#52514e"
+
+
+# %% Block 2: Download and prepare the data
+# Reads both original files directly from the UCI repository at runtime with
+# pandas (team decision D1), because the professor requires the script to
+# download the data itself (manual p. 4, slide 7). Then names the columns,
+# parses the time stamps, recodes the label to fail = 1 / pass = 0 (decision D2)
+# and keeps features (X) and target (y) as separate objects (manual Section 2.1).
+# Nothing is removed or changed in the sensor values here. The two downloaded
+# files are saved unchanged in data/raw; the prepared data is saved in data/processed.
+
+
+def download_file(url, raw_file_name):
+    """
+    Download a file from the internet and save its bytes unchanged in data/raw.
+
+    Input:  url (str: web address of the file), raw_file_name (str: name in data/raw)
+    Output: the downloaded bytes (so the data is read from the download itself,
+            never from a local copy)
+    """
+    # urlopen() requests the file; read() returns its exact bytes. timeout=60
+    # stops waiting after 60 seconds if UCI does not answer.
+    with urllib.request.urlopen(url, timeout=60) as response:
+        file_bytes = response.read()
+    # "wb" = write bytes: the raw file is byte-for-byte what UCI published and is
+    # rewritten on every run, so it always matches the current download.
+    with open(RAW_DATA_FOLDER / raw_file_name, "wb") as raw_file:
+        raw_file.write(file_bytes)
+    print("Downloaded", len(file_bytes), "bytes and saved", RAW_DATA_FOLDER / raw_file_name)
+    return file_bytes
+
+
+def save_processed(features, target, file_name):
+    """
+    Save a prepared version of the data as a CSV file in data/processed.
+
+    Input:  features (DataFrame), target (Series with the label, same rows as features),
+            file_name (str, for example "block4_train_split.csv")
+    Output: none (the file is written and its path printed)
+    """
+    # Copy so the features in memory are not changed; add the label as the last column.
+    table = features.copy()
+    table["target"] = target
+    # index_label="wafer_id" stores each wafer's original row number, so every
+    # row can be traced back to the raw files.
+    table.to_csv(PROCESSED_DATA_FOLDER / file_name, index_label="wafer_id")
+    print("Saved processed data:", PROCESSED_DATA_FOLDER / file_name, table.shape)
+
+
+sensor_bytes = download_file(URL_SENSOR_DATA, "secom.data")
+label_bytes = download_file(URL_LABELS, "secom_labels.data")
+
+# Read the sensor readings from the downloaded bytes (io.BytesIO lets pandas read
+# bytes in memory as if they were a file). Values are separated by a single
+# space (sep=" "; the pandas default would be a comma) and there is no header
+# row (header=None; by default pandas would use the first wafer as column names).
+# na_values=["NaN"] states explicitly that the text "NaN" marks a missing
+# reading, so every gap becomes a real missing value (rule 5) instead of
+# relying silently on pandas' default list of missing-value markers.
+sensor_data = pd.read_csv(io.BytesIO(sensor_bytes), sep=" ", header=None, na_values=["NaN"])
+
+# Read the labels file: column 1 is the label, column 2 the test date and time.
+# names= gives the two columns their names directly. The date-time contains a
+# space but stays one field, because it is written in double quotes and '"' is
+# pandas' default quote character.
+labels = pd.read_csv(io.BytesIO(label_bytes), sep=" ", header=None, names=["target", "timestamp"])
+
+# Check that both files describe the same 1567 wafers. The files have no wafer
+# ID: row i of the labels belongs to row i of the sensors, so a different row
+# count would mean the two files no longer match. The script stops in that case.
+print("Rows in sensor file:", len(sensor_data), "| rows in labels file:", len(labels))
+if len(sensor_data) != EXPECTED_ROWS or len(labels) != EXPECTED_ROWS:
+    raise ValueError("Expected " + str(EXPECTED_ROWS) + " rows in both files.")
+
+# Name the columns sensor_0 to sensor_589, so every sensor keeps a traceable name
+# through all later steps (manual Checklist 2.1). The loop builds one name per
+# column; range(n) counts from 0 to n - 1.
+sensor_names = []
+for column_number in range(sensor_data.shape[1]):
+    sensor_names.append("sensor_" + str(column_number))
+sensor_data.columns = sensor_names
+print("Columns:", len(sensor_names), "from", sensor_names[0], "to", sensor_names[-1])
+
+# Turn the time stamps from text into real dates (decision D3: parse and explore).
+# The file writes day/month/year (for example "19/07/2008 11:55:00"), so the
+# format is given explicitly: without it, a date such as 01/08/2008 could be read
+# as 8 January instead of 1 August. A value in any other format raises an error.
+labels["timestamp"] = pd.to_datetime(labels["timestamp"], format="%d/%m/%Y %H:%M:%S")
+print("Test dates from", labels["timestamp"].min(), "to", labels["timestamp"].max())
+
+# Recode the label (decision D2): UCI uses -1 = pass and 1 = fail; scikit-learn
+# treats 1 as the positive class, so pass becomes 0 and fail stays 1.
+counts_before = labels["target"].value_counts()
+print("Label counts before recoding (-1 = pass, 1 = fail):")
+print(counts_before)
+
+# map() replaces each value using the dictionary. Any value not in the
+# dictionary would become missing, so zero missing values afterwards proves that
+# the file contained only -1 and 1.
+labels["target"] = labels["target"].map({-1: 0, 1: 1})
+if labels["target"].isna().sum() != 0:
+    raise ValueError("The labels file contains values other than -1 and 1.")
+
+counts_after = labels["target"].value_counts()
+print("Label counts after recoding (0 = pass, 1 = fail):")
+print(counts_after)
+
+# Proof of correct recoding: every former -1 must now be 0, every 1 must still be 1.
+if counts_before[-1] != counts_after[0] or counts_before[1] != counts_after[1]:
+    raise ValueError("Label counts changed during recoding.")
+print("Recoding check passed: pass", counts_before[-1], "->", counts_after[0],
+      "| fail", counts_before[1], "->", counts_after[1])
+
+# Keep features and target as separate objects (manual 2.1): X holds only what a
+# model may use, y what it must predict, so the label can never slip into the
+# features by accident. The time stamps are kept separately for exploration.
+X = sensor_data
+y = labels["target"]
+timestamps = labels["timestamp"]
+print("X shape:", X.shape, "| y shape:", y.shape)
+
+# Processed data, step 1: the full labelled data (named sensors, recoded target)
+# plus the parsed time stamp, before any split or cleaning.
+X_with_timestamp = X.copy()
+X_with_timestamp["timestamp"] = timestamps
+save_processed(X_with_timestamp, y, "block2_secom_labelled.csv")
+
+
+# %% Block 3: Data understanding (descriptive analysis of the full data)
+# Describes the full data set before the split: structure, class balance, scales,
+# variance, missing values, failures over time and correlations (manual Sections
+# 2.2 to 2.7; "Descriptive Analysis" in the professor's slides). This block only
+# describes: nothing is removed, filled in or fitted, and no threshold is chosen
+# here. All cleaning thresholds are decided later on the training set only
+# (Block 5), so the test set never influences a decision (rules 1 and 2).
+
+
+def save_figure(figure, file_name):
+    """
+    Save a figure as a PNG file in results/figures and close it.
+
+    Input:  figure (matplotlib Figure), file_name (str, for example "block3_01_x.png")
+    Output: none (the file is written and its path printed)
+    """
+    file_path = FIGURES_FOLDER / file_name
+    # dpi=150 gives a sharp image for slides; bbox_inches="tight" trims empty margins.
+    figure.savefig(file_path, dpi=150, bbox_inches="tight")
+    # Closing frees memory and stops figures from piling up or popping up as windows.
+    plt.close(figure)
+    print("Saved figure:", file_path)
+
+
+def plot_variance_histogram(column_variances, title, file_name):
+    """
+    Draw a histogram of column variances on a log10 scale and save it.
+    Variances span many orders of magnitude, so log10 is used (-2 = 0.01,
+    0 = 1, 2 = 100). The log of 0 does not exist, so zero variances are left out.
+
+    Input:  column_variances (Series: one variance per column), title (str), file_name (str)
+    Output: none (the figure is saved)
+    """
+    nonzero_variances = column_variances[column_variances > 0]
+    log_variances = np.log10(nonzero_variances)
+    figure, axis = plt.subplots(figsize=(8, 4))
+    axis.hist(log_variances, bins=40, color=COLOR_MAIN, edgecolor="white")
+    axis.set_xlabel("Column variance, log10 scale (-2 = 0.01, 0 = 1, 2 = 100)")
+    axis.set_ylabel("Number of columns")
+    axis.set_title(title)
+    axis.spines["top"].set_visible(False)
+    axis.spines["right"].set_visible(False)
+    save_figure(figure, file_name)
+
+
+def plot_variance_pareto(column_variances, title, file_name):
+    """
+    Draw a Pareto chart of variance thresholds (x, log scale) against the number
+    of columns with a variance at or below each threshold (y), and save it.
+    np.logspace(-8, 8, 33) gives 33 thresholds from 10^-8 to 10^8, two per
+    power of ten, covering the range of SECOM's variances.
+
+    Input:  column_variances (Series: one variance per column), title (str), file_name (str)
+    Output: DataFrame with the columns variance_threshold and columns_at_or_below
+    """
+    variance_thresholds = np.logspace(-8, 8, 33)
+    columns_at_or_below = []
+    for threshold in variance_thresholds:
+        columns_at_or_below.append((column_variances <= threshold).sum())
+
+    figure, axis = plt.subplots(figsize=(8, 4))
+    axis.plot(variance_thresholds, columns_at_or_below, marker="o", markersize=4,
+              linewidth=2, color=COLOR_MAIN)
+    axis.set_xscale("log")
+    # A reference line for the zero-variance columns, only if there are any.
+    zero_count = (column_variances == 0).sum()
+    if zero_count > 0:
+        axis.axhline(zero_count, linestyle="--", color=COLOR_REFERENCE)
+        axis.text(variance_thresholds[-1], zero_count + 10, str(zero_count) + " zero-variance columns ",
+                  ha="right", va="bottom", color=COLOR_REFERENCE)
+    axis.set_xlabel("Variance threshold (log scale)")
+    axis.set_ylabel("Columns with variance at or below threshold")
+    axis.set_title(title)
+    axis.spines["top"].set_visible(False)
+    axis.spines["right"].set_visible(False)
+    save_figure(figure, file_name)
+
+    return pd.DataFrame({"variance_threshold": variance_thresholds,
+                         "columns_at_or_below": columns_at_or_below})
+
+
+def plot_missing_per_column(missing_percent_per_column, title, file_name):
+    """
+    Draw the manual's missing-value "histogram": one bar per column (x = column,
+    y = % missing), sorted from most to least missing, with reference lines at
+    55 % (papers) and 60 % (manual), and save it.
+
+    Input:  missing_percent_per_column (Series: % missing per column), title (str), file_name (str)
+    Output: none (the figure is saved)
+    """
+    missing_percent_sorted = missing_percent_per_column.sort_values(ascending=False)
+    figure, axis = plt.subplots(figsize=(10, 4))
+    column_positions = range(len(missing_percent_sorted))
+    axis.bar(column_positions, missing_percent_sorted.values, width=1.0, color=COLOR_MAIN)
+    for reference_percent in [55, 60]:
+        axis.axhline(reference_percent, linestyle="--", linewidth=1, color=COLOR_REFERENCE)
+    axis.text(len(missing_percent_sorted), 55, "55 % (papers) ", ha="right", va="top", color=COLOR_REFERENCE)
+    axis.text(len(missing_percent_sorted), 60, "60 % (manual) ", ha="right", va="bottom", color=COLOR_REFERENCE)
+    axis.set_xlabel("Sensor columns, sorted from most to least missing ("
+                    + str(len(missing_percent_sorted)) + " columns)")
+    axis.set_ylabel("% missing")
+    axis.set_title(title)
+    axis.spines["top"].set_visible(False)
+    axis.spines["right"].set_visible(False)
+    save_figure(figure, file_name)
+
+
+def plot_missing_pareto(missing_percent_per_column, title, file_name):
+    """
+    Draw a Pareto chart of missing-value thresholds 0, 5, ..., 100 % (x) against
+    the number of columns with MORE missing values than the threshold, i.e. the
+    columns that would be removed (y), and save it.
+
+    Input:  missing_percent_per_column (Series: % missing per column), title (str), file_name (str)
+    Output: DataFrame with the columns threshold_percent and columns_removed
+    """
+    missing_thresholds = list(range(0, 101, 5))
+    columns_removed = []
+    for threshold in missing_thresholds:
+        columns_removed.append((missing_percent_per_column > threshold).sum())
+
+    figure, axis = plt.subplots(figsize=(8, 4))
+    axis.plot(missing_thresholds, columns_removed, marker="o", markersize=5, linewidth=2, color=COLOR_MAIN)
+    for reference_percent in [55, 60]:
+        axis.axvline(reference_percent, linestyle="--", linewidth=1, color=COLOR_REFERENCE)
+    axis.text(55, max(columns_removed), "55 % ", ha="right", va="top", color=COLOR_REFERENCE)
+    axis.text(60, max(columns_removed), " 60 %", ha="left", va="top", color=COLOR_REFERENCE)
+    axis.set_xlabel("Missing-value threshold (%)")
+    axis.set_ylabel("Columns that would be removed")
+    axis.set_title(title)
+    axis.spines["top"].set_visible(False)
+    axis.spines["right"].set_visible(False)
+    save_figure(figure, file_name)
+
+    return pd.DataFrame({"threshold_percent": missing_thresholds,
+                         "columns_removed": columns_removed})
+
+
+def find_strong_pairs(correlation_matrix, limit):
+    """
+    List every pair of columns whose absolute correlation is above a limit.
+    The loop visits each pair once (j starts after i, so a column is never
+    paired with itself); a missing r (not enough shared wafers) never counts.
+
+    Input:  correlation_matrix (DataFrame: square matrix of r values), limit (float, e.g. 0.8)
+    Output: DataFrame with sensor_a, sensor_b and r, strongest first
+    """
+    column_names = correlation_matrix.columns
+    r_values = correlation_matrix.values
+    pair_rows = []
+    for i in range(len(column_names)):
+        for j in range(i + 1, len(column_names)):
+            if abs(r_values[i, j]) > limit:
+                pair_rows.append({"sensor_a": column_names[i],
+                                  "sensor_b": column_names[j],
+                                  "r": round(r_values[i, j], 4)})
+    strong_pairs_table = pd.DataFrame(pair_rows, columns=["sensor_a", "sensor_b", "r"])
+    # Sort by the size of r, ignoring its sign (key=abs), largest first.
+    strong_pairs_table = strong_pairs_table.sort_values("r", key=abs, ascending=False)
+    return strong_pairs_table.reset_index(drop=True)
+
+
+def plot_correlation_heatmap(correlation_matrix, title, file_name):
+    """
+    Draw a correlation matrix as a heatmap and save it. Diverging colours:
+    blue = negative, white = 0, red = positive, fixed from -1 to +1 so colours
+    mean the same in every heatmap; pairs without an r are light grey.
+
+    Input:  correlation_matrix (DataFrame: square matrix of r values), title (str), file_name (str)
+    Output: none (the figure is saved)
+    """
+    heatmap_colors = plt.get_cmap("RdBu_r").copy()
+    heatmap_colors.set_bad("lightgrey")
+    figure, axis = plt.subplots(figsize=(9, 8))
+    heatmap_image = axis.imshow(correlation_matrix.values, cmap=heatmap_colors, vmin=-1, vmax=1)
+    colour_bar = figure.colorbar(heatmap_image, ax=axis, shrink=0.8)
+    colour_bar.set_label("Pearson correlation r")
+    # Hundreds of sensor names cannot be read, so the tick labels are hidden.
+    axis.set_xticks([])
+    axis.set_yticks([])
+    axis.set_xlabel("Sensor columns (" + str(len(correlation_matrix.columns)) + ", original order)")
+    axis.set_ylabel("Sensor columns")
+    axis.set_title(title)
+    save_figure(figure, file_name)
+
+
+# ----- 3.1 Structure: shape, data types, duplicated rows (manual 2.2) -----
+print("\n--- 3.1 Structure ---")
+print("Shape of X (wafers, sensors):", X.shape)
+print("Data types of the sensor columns:")
+print(X.dtypes.value_counts())
+
+# duplicated() marks a row that is identical to an earlier row in every column
+# (pandas treats two missing values in the same place as equal). The check is
+# done on the sensors alone and on sensors plus label.
+duplicated_rows = X.duplicated().sum()
+X_with_label = X.copy()
+X_with_label["target"] = y
+duplicated_rows_with_label = X_with_label.duplicated().sum()
+print("Duplicated rows (sensors only):", duplicated_rows)
+print("Duplicated rows (sensors and label):", duplicated_rows_with_label)
+
+
+# ----- 3.2 Class distribution and imbalance tier (manual 2.3) -----
+print("\n--- 3.2 Class distribution ---")
+# sort_index() puts pass (0) before fail (1).
+class_counts = y.value_counts().sort_index()
+class_percent = class_counts / len(y) * 100
+class_table = pd.DataFrame({"wafers": class_counts, "percent": class_percent.round(2)})
+class_table.index = ["pass (0)", "fail (1)"]
+print(class_table)
+class_table.to_csv(TABLES_FOLDER / "block3_class_distribution.csv")
+
+# Imbalance tier from the manual (Section 2.3): extreme below 1 %, moderate
+# 1 to 20 %, mild 20 to 40 % minority share.
+failure_percent = class_percent[1]
+if failure_percent < 1:
+    imbalance_tier = "extreme"
+elif failure_percent <= 20:
+    imbalance_tier = "moderate"
+elif failure_percent <= 40:
+    imbalance_tier = "mild"
+else:
+    imbalance_tier = "balanced"
+print("Failure share:", round(failure_percent, 2), "% -> imbalance tier:", imbalance_tier)
+
+# Bar chart with the count and percentage written on each bar, so the numbers
+# can be read without relying on colour.
+figure, axis = plt.subplots(figsize=(6, 4))
+bar_names = ["Pass (0)", "Fail (1)"]
+bar_heights = [class_counts[0], class_counts[1]]
+bar_percents = [class_percent[0], class_percent[1]]
+axis.bar(bar_names, bar_heights, color=[COLOR_PASS, COLOR_FAIL], width=0.6)
+for position in range(len(bar_names)):
+    bar_label = str(bar_heights[position]) + " (" + str(round(bar_percents[position], 1)) + " %)"
+    axis.text(position, bar_heights[position], bar_label, ha="center", va="bottom")
+axis.set_ylabel("Number of wafers")
+axis.set_title("Class distribution, full data (" + imbalance_tier + " imbalance)")
+axis.spines["top"].set_visible(False)
+axis.spines["right"].set_visible(False)
+save_figure(figure, "block3_01_class_distribution.png")
+
+
+# ----- 3.3 Descriptive statistics and scales (manual 2.4.1) -----
+print("\n--- 3.3 Descriptive statistics ---")
+# describe() gives count (non-missing values), mean, std, min, quartiles and max
+# for every column; .T turns it so that each sensor is one row.
+feature_summary = X.describe().T
+feature_summary.to_csv(TABLES_FOLDER / "block3_descriptive_statistics.csv")
+print(feature_summary[["count", "mean", "std", "min", "max"]].head(10))
+
+# The range of means and standard deviations across sensors shows how different
+# their scales are.
+print("Smallest / largest column mean:", round(feature_summary["mean"].min(), 3), "/",
+      round(feature_summary["mean"].max(), 3))
+print("Smallest / largest column std: ", round(feature_summary["std"].min(), 3), "/",
+      round(feature_summary["std"].max(), 3))
+print("Fewest non-missing values in one column:", int(feature_summary["count"].min()), "of", len(X))
+
+
+# ----- 3.4 Zero-variance columns (manual 4.2, described only) -----
+print("\n--- 3.4 Zero-variance columns ---")
+# var() is the sample variance of each column (pandas default ddof=1, divides by
+# n - 1) and ignores missing values (default skipna=True).
+column_variances = X.var()
+zero_variance_columns = column_variances[column_variances == 0].index.tolist()
+print("Columns with variance exactly 0:", len(zero_variance_columns))
+
+
+# ----- 3.5 Low-variance analysis: histogram and Pareto chart -----
+print("\n--- 3.5 Low-variance analysis ---")
+# Histogram and Pareto chart of the column variances (functions above).
+plot_variance_histogram(column_variances,
+                        "Variance per column, full data (" + str(len(zero_variance_columns))
+                        + " zero-variance columns not shown)",
+                        "block3_02_variance_histogram.png")
+variance_pareto = plot_variance_pareto(column_variances,
+                                       "Low-variance Pareto chart, full data (analysis only, no action)",
+                                       "block3_03_variance_pareto.png")
+variance_pareto.to_csv(TABLES_FOLDER / "block3_variance_pareto.csv", index=False)
+
+# Print the count at each power of ten (every second threshold).
+for position in range(0, len(variance_pareto), 2):
+    print("  variance <=", variance_pareto["variance_threshold"][position], ":",
+          variance_pareto["columns_at_or_below"][position], "columns")
+
+
+# ----- 3.6 Missing values: totals, per-column chart and Pareto chart (manual 2.5) -----
+print("\n--- 3.6 Missing values ---")
+total_missing = X.isna().sum().sum()
+missing_percent_overall = total_missing / X.size * 100
+print("Missing values in total:", total_missing, "of", X.size, "cells (",
+      round(missing_percent_overall, 2), "% )")
+
+# isna() is True for a missing value; the mean of True/False per column is the
+# share of missing values, times 100 gives the percentage.
+missing_percent_per_column = X.isna().mean() * 100
+missing_percent_sorted = missing_percent_per_column.sort_values(ascending=False)
+print("Columns with at least one missing value:", (missing_percent_per_column > 0).sum())
+print("Ten columns with the most missing values (%):")
+print(missing_percent_sorted.head(10).round(1))
+missing_percent_sorted.round(2).to_csv(TABLES_FOLDER / "block3_missing_per_column.csv",
+                                        header=["percent_missing"])
+
+# (a) Per-column chart and (b) Pareto chart (functions above).
+plot_missing_per_column(missing_percent_per_column, "Missing values per column, full data",
+                        "block3_04_missing_per_column.png")
+missing_pareto = plot_missing_pareto(missing_percent_per_column,
+                                     "Missingness Pareto chart, full data (no threshold chosen here)",
+                                     "block3_05_missing_pareto.png")
+
+for position in range(len(missing_pareto)):
+    print("  missing >", missing_pareto["threshold_percent"][position], "% :",
+          missing_pareto["columns_removed"][position], "columns")
+
+
+# ----- 3.7 Missing values by class (manual 2.5) -----
+print("\n--- 3.7 Missing values by class ---")
+# Number of missing values in each wafer (row), then the average and the median
+# per class. groupby(y) splits the wafers into pass (0) and fail (1).
+missing_per_wafer = X.isna().sum(axis=1)
+missing_by_class_mean = missing_per_wafer.groupby(y).mean()
+missing_by_class_median = missing_per_wafer.groupby(y).median()
+print("Average missing values per wafer: pass", round(missing_by_class_mean[0], 2),
+      "| fail", round(missing_by_class_mean[1], 2))
+print("Median missing values per wafer:  pass", missing_by_class_median[0],
+      "| fail", missing_by_class_median[1])
+
+figure, axis = plt.subplots(figsize=(6, 4))
+class_means = [missing_by_class_mean[0], missing_by_class_mean[1]]
+axis.bar(bar_names, class_means, color=[COLOR_PASS, COLOR_FAIL], width=0.6)
+for position in range(len(bar_names)):
+    axis.text(position, class_means[position], str(round(class_means[position], 1)),
+              ha="center", va="bottom")
+axis.set_ylabel("Average missing values per wafer")
+axis.set_title("Missing values per wafer by class, full data")
+axis.spines["top"].set_visible(False)
+axis.spines["right"].set_visible(False)
+save_figure(figure, "block3_06_missing_by_class.png")
+
+
+# ----- 3.8 Failures over time (decision D3: parse and explore) -----
+print("\n--- 3.8 Failures over time ---")
+# to_period("W") assigns each test date to its calendar week (pandas default:
+# weeks running Monday to Sunday). Then count wafers and failures per week.
+calendar_week = timestamps.dt.to_period("W")
+wafers_per_week = y.groupby(calendar_week).size()
+failures_per_week = y.groupby(calendar_week).sum()
+failure_rate_per_week = failures_per_week / wafers_per_week * 100
+weekly_table = pd.DataFrame({"wafers": wafers_per_week,
+                             "failures": failures_per_week,
+                             "failure_rate_percent": failure_rate_per_week.round(2)})
+print(weekly_table)
+weekly_table.to_csv(TABLES_FOLDER / "block3_failures_per_week.csv")
+
+# Two charts stacked with one shared date axis, instead of one chart with two
+# different y-scales, which is easy to misread. Each week is labelled by its
+# Monday, written as "21 Jul".
+week_labels = []
+for week in weekly_table.index:
+    week_labels.append(week.start_time.strftime("%d %b"))
+
+figure, (axis_top, axis_bottom) = plt.subplots(2, 1, figsize=(9, 6), sharex=True)
+axis_top.bar(week_labels, weekly_table["wafers"], color=COLOR_MAIN)
+axis_top.set_ylabel("Wafers tested")
+axis_top.set_title("Wafers tested and failure rate per week, Jul to Oct 2008")
+axis_bottom.plot(week_labels, weekly_table["failure_rate_percent"], marker="o",
+                 linewidth=2, color=COLOR_FAIL)
+axis_bottom.axhline(failure_percent, linestyle="--", linewidth=1, color=COLOR_REFERENCE)
+axis_bottom.text(0, failure_percent,
+                 "overall " + str(round(failure_percent, 1)) + " %",
+                 ha="left", va="top", color=COLOR_REFERENCE)
+axis_bottom.set_ylabel("Failure rate (%)")
+axis_bottom.set_xlabel("Week starting")
+axis_bottom.tick_params(axis="x", labelrotation=45)
+for axis in [axis_top, axis_bottom]:
+    axis.spines["top"].set_visible(False)
+    axis.spines["right"].set_visible(False)
+save_figure(figure, "block3_07_failures_over_time.png")
+
+
+# ----- 3.9 Correlation heatmap (manual 4.6: visualise, do not remove) -----
+print("\n--- 3.9 Correlation heatmap ---")
+# Pearson correlation between every pair of non-constant columns (a constant
+# column has no correlation). pandas' corr() uses, for each pair, the wafers
+# where both values exist (pairwise deletion, its default).
+non_constant_columns = column_variances[column_variances > 0].index
+correlation_matrix = X[non_constant_columns].corr()
+
+# Pairs with |r| > CORRELATION_LIMIT (the papers' removal rule, reported only),
+# then the heatmap (functions above).
+strong_pairs_full = find_strong_pairs(correlation_matrix, CORRELATION_LIMIT)
+print("Non-constant columns in the heatmap:", len(non_constant_columns))
+print("Pairs with |r| >", CORRELATION_LIMIT, ":", len(strong_pairs_full))
+plot_correlation_heatmap(correlation_matrix,
+                         "Correlation heatmap, full data (" + str(len(strong_pairs_full))
+                         + " pairs with |r| > " + str(CORRELATION_LIMIT) + ")",
+                         "block3_08_correlation_heatmap.png")
+
+# %% Block 4: Stratified train/test split
+# Splits the wafers into 80 % training and 20 % test data BEFORE any cleaning,
+# so that no rule learned later can be influenced by the test wafers (manual
+# Section 3, rule 1). Stratified on the label, because with only 104 failures a
+# purely random split could put noticeably more or fewer of them in the test set.
+
+# test_size=TEST_SIZE (0.2) puts 20 % of the wafers in the test set.
+# stratify=y draws 20 % from the pass wafers and 20 % from the fail wafers
+# separately, so both sets keep the failure share of the full data.
+# random_state=SEED fixes the random draw, so the split is identical on every run
+# and every laptop. shuffle=True (default) mixes the wafers first, which matters
+# because the files are ordered by test date.
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=TEST_SIZE, stratify=y, random_state=SEED
+)
+
+# Checks: the two sets together contain every wafer exactly once, and X and y
+# still belong together. The index keeps each wafer's original row number, so
+# overlap can be checked directly.
+print("\n--- 4.1 Split sizes ---")
+print("Training set:", X_train.shape, "| test set:", X_test.shape)
+wafers_in_both = X_train.index.intersection(X_test.index)
+if len(X_train) + len(X_test) != len(X) or len(wafers_in_both) != 0:
+    raise ValueError("The split lost, duplicated or shared wafers.")
+if not X_train.index.equals(y_train.index) or not X_test.index.equals(y_test.index):
+    raise ValueError("X and y rows do not match after the split.")
+print("Check passed: every wafer is in exactly one set, X and y match.")
+
+# Processed data: both sets straight after the split. The test set file is only
+# a stored copy of the locked test wafers; nothing is learned from it.
+save_processed(X_train, y_train, "block4_train_split.csv")
+save_processed(X_test, y_test, "block4_test_split.csv")
+
+# Class counts and percentages in the full data, training set and test set
+# ("before and after splitting", manual 3.3).
+print("\n--- 4.2 Class shares before and after splitting ---")
+set_names = ["Full data", "Training set", "Test set"]
+set_targets = [y, y_train, y_test]
+split_rows = []
+for position in range(len(set_names)):
+    target = set_targets[position]
+    failures = int(target.sum())
+    passes = len(target) - failures
+    split_rows.append({"set": set_names[position],
+                       "wafers": len(target),
+                       "pass": passes,
+                       "fail": failures,
+                       "percent_pass": round(passes / len(target) * 100, 2),
+                       "percent_fail": round(failures / len(target) * 100, 2)})
+split_table = pd.DataFrame(split_rows)
+print(split_table.to_string(index=False))
+split_table.to_csv(TABLES_FOLDER / "block4_split_proportions.csv", index=False)
+
+# Bar chart of the failure share in the three sets, each bar labelled with its
+# percentage and number of failures.
+figure, axis = plt.subplots(figsize=(7, 4))
+axis.bar(split_table["set"], split_table["percent_fail"], color=COLOR_FAIL, width=0.6)
+for position in range(len(split_table)):
+    bar_label = (str(split_table["percent_fail"][position]) + " %\n("
+                 + str(split_table["fail"][position]) + " of "
+                 + str(split_table["wafers"][position]) + ")")
+    axis.text(position, split_table["percent_fail"][position], bar_label,
+              ha="center", va="bottom")
+axis.set_ylim(0, split_table["percent_fail"].max() * 1.35)
+axis.set_ylabel("Failed wafers (%)")
+axis.set_title("Failure share before and after the stratified 80/20 split")
+axis.spines["top"].set_visible(False)
+axis.spines["right"].set_visible(False)
+save_figure(figure, "block4_01_failure_share_split.png")
+
+# ---------------------------------------------------------------------------
+# THE TEST SET IS NOW LOCKED (manual 3.4, rules 1, 2 and 7).
+# From here on:
+# - every rule (columns removed, thresholds, outlier bounds, scaling, imputation,
+#   selected features, balancing, model, hyperparameters, decision threshold)
+#   is learned from X_train / y_train only, and stored in a variable;
+# - X_test is only used to APPLY those stored rules, at the final evaluation
+#   (Block 17); nothing is ever fitted on it;
+# - y_test is not used at all before Block 17.
+# ---------------------------------------------------------------------------
+
+# %% Block 5: Rough feature reduction (training set only)
+# A first, conservative reduction that removes only columns that clearly carry
+# no information or are mostly empty: zero-variance columns, duplicated columns
+# and columns above the missing-value threshold (manual Section 4.1 to 4.5;
+# "Cleaning of Training Set" in the professor's slides). Every decision is
+# calculated on X_train only. Each list of removed columns is stored, so that
+# exactly the same columns are removed from X_test at the final evaluation
+# (Block 17). X_test is not used in this block.
+
+# Working copy of the training set, so X_train itself stays unchanged.
+X_train_reduced = X_train.copy()
+
+# Each step adds one row to this before -> after table.
+reduction_rows = [{"step": "Original training set",
+                   "columns_before": X_train.shape[1],
+                   "columns_removed": 0,
+                   "columns_after": X_train.shape[1]}]
+
+
+# ----- 5.1 Duplicated rows in the training set -----
+print("\n--- 5.1 Duplicated rows (training set) ---")
+# A duplicated wafer would count twice in training. Rows are only ever removed
+# from the training set; test wafers are never removed.
+duplicated_training_rows = X_train_reduced.duplicated().sum()
+print("Duplicated rows in the training set:", duplicated_training_rows)
+if duplicated_training_rows > 0:
+    keep_rows = ~X_train_reduced.duplicated()
+    X_train_reduced = X_train_reduced[keep_rows]
+    y_train = y_train[keep_rows]
+    print("Removed duplicated rows; training wafers now:", len(X_train_reduced))
+
+
+# ----- 5.2 Zero-variance columns (manual 4.2) -----
+print("\n--- 5.2 Zero-variance columns (training set) ---")
+# Variance per column on the training set (pandas default ddof=1, missing values
+# ignored). A column with variance 0 has the same value for every training wafer.
+training_variances = X_train_reduced.var()
+removed_zero_variance = training_variances[training_variances == 0].index.tolist()
+columns_before = X_train_reduced.shape[1]
+X_train_reduced = X_train_reduced.drop(columns=removed_zero_variance)
+print("Columns before:", columns_before, "| removed:", len(removed_zero_variance),
+      "| after:", X_train_reduced.shape[1])
+reduction_rows.append({"step": "Zero-variance columns removed",
+                       "columns_before": columns_before,
+                       "columns_removed": len(removed_zero_variance),
+                       "columns_after": X_train_reduced.shape[1]})
+
+
+# ----- 5.3 Duplicated columns (manual 4.3) -----
+print("\n--- 5.3 Duplicated columns (training set) ---")
+# .T turns columns into rows, so duplicated() can compare whole columns; it marks
+# every column that is identical to an earlier column (the first one is kept).
+duplicated_column_mask = X_train_reduced.T.duplicated()
+removed_duplicate_columns = X_train_reduced.columns[duplicated_column_mask].tolist()
+columns_before = X_train_reduced.shape[1]
+X_train_reduced = X_train_reduced.drop(columns=removed_duplicate_columns)
+print("Columns before:", columns_before, "| removed:", len(removed_duplicate_columns),
+      "| after:", X_train_reduced.shape[1])
+reduction_rows.append({"step": "Duplicated columns removed",
+                       "columns_before": columns_before,
+                       "columns_removed": len(removed_duplicate_columns),
+                       "columns_after": X_train_reduced.shape[1]})
+
+
+# ----- 5.4 Low-variance analysis (analysis only, NO action) -----
+print("\n--- 5.4 Low-variance analysis (training set, no action) ---")
+# Same histogram and Pareto chart as in Block 3, now on the remaining training
+# columns. No column is removed (professor's slide 8): a small variance can
+# simply reflect a sensor's unit, not a lack of information.
+training_variances = X_train_reduced.var()
+plot_variance_histogram(training_variances,
+                        "Variance per column, training set (" + str(X_train_reduced.shape[1]) + " columns)",
+                        "block5_01_variance_histogram_train.png")
+variance_pareto_train = plot_variance_pareto(training_variances,
+                                             "Low-variance Pareto chart, training set (analysis only, no action)",
+                                             "block5_02_variance_pareto_train.png")
+for position in range(0, len(variance_pareto_train), 2):
+    print("  variance <=", variance_pareto_train["variance_threshold"][position], ":",
+          variance_pareto_train["columns_at_or_below"][position], "columns")
+
+
+# ----- 5.5 Missing values and threshold (decision D5, manual 4.4 and 4.5) -----
+print("\n--- 5.5 Missing values (training set) ---")
+missing_percent_train = X_train_reduced.isna().mean() * 100
+total_missing_train = X_train_reduced.isna().sum().sum()
+print("Missing values in the training set:", total_missing_train, "(",
+      round(total_missing_train / X_train_reduced.size * 100, 2), "% of cells )")
+
+plot_missing_per_column(missing_percent_train, "Missing values per column, training set",
+                        "block5_03_missing_per_column_train.png")
+missing_pareto_train = plot_missing_pareto(missing_percent_train,
+                                           "Missingness Pareto chart, training set",
+                                           "block5_04_missing_pareto_train.png")
+for position in range(len(missing_pareto_train)):
+    print("  missing >", missing_pareto_train["threshold_percent"][position], "% :",
+          missing_pareto_train["columns_removed"][position], "columns")
+
+# Columns with MORE missing values than MISSING_THRESHOLD are removed (manual 4.5).
+removed_missing_columns = missing_percent_train[missing_percent_train > MISSING_THRESHOLD].index.tolist()
+print("Columns above", MISSING_THRESHOLD, "% missing (with their % missing):")
+print(missing_percent_train[removed_missing_columns].sort_values(ascending=False).round(2))
+columns_before = X_train_reduced.shape[1]
+X_train_reduced = X_train_reduced.drop(columns=removed_missing_columns)
+print("Columns before:", columns_before, "| removed:", len(removed_missing_columns),
+      "| after:", X_train_reduced.shape[1])
+reduction_rows.append({"step": "Columns with more than " + str(MISSING_THRESHOLD) + " % missing removed",
+                       "columns_before": columns_before,
+                       "columns_removed": len(removed_missing_columns),
+                       "columns_after": X_train_reduced.shape[1]})
+
+
+# ----- 5.6 Before -> after table and the stored rule for the test set -----
+print("\n--- 5.6 Feature reduction summary ---")
+reduction_table = pd.DataFrame(reduction_rows)
+print(reduction_table.to_string(index=False))
+reduction_table.to_csv(TABLES_FOLDER / "block5_feature_reduction.csv", index=False)
+
+# One list of every removed column with its reason. This is the stored rule:
+# at the final evaluation (Block 17), X_test.drop(columns=columns_removed_in_block5)
+# removes exactly these columns from the test set.
+columns_removed_in_block5 = removed_zero_variance + removed_duplicate_columns + removed_missing_columns
+removed_reasons = []
+for column in removed_zero_variance:
+    removed_reasons.append({"column": column, "reason": "zero variance"})
+for column in removed_duplicate_columns:
+    removed_reasons.append({"column": column, "reason": "duplicate of another column"})
+for column in removed_missing_columns:
+    removed_reasons.append({"column": column,
+                            "reason": "more than " + str(MISSING_THRESHOLD) + " % missing"})
+pd.DataFrame(removed_reasons).to_csv(TABLES_FOLDER / "block5_removed_columns.csv", index=False)
+print("Columns removed in total:", len(columns_removed_in_block5),
+      "| remaining training columns:", X_train_reduced.shape[1])
+
+# Processed data: the training set after the feature reduction (450 columns).
+save_processed(X_train_reduced, y_train, "block5_train_reduced.csv")
+
+# %% Block 6: Correlation analysis on the training set (visualise only)
+# Shows how strongly the 450 remaining training columns move together (manual
+# Section 4.6). Unlike Munirathinam and Ramadoss (2016), who dropped one sensor
+# of every pair with |r| >= 0.8, NO column is removed here: without a measure of
+# which sensor predicts failure better, the choice would be arbitrary. Redundancy
+# is handled later by Boruta (Block 10), which uses the label.
+print("\n--- 6.1 Correlation analysis (training set) ---")
+
+# Pearson correlation between every pair of remaining training columns. pandas'
+# corr() uses method="pearson" by default and, for each pair, only the wafers
+# where both values exist (pairwise deletion).
+correlation_matrix_train = X_train_reduced.corr()
+
+# Pairs above the limit, strongest first; saved as a table, nothing removed.
+strong_pairs_train = find_strong_pairs(correlation_matrix_train, CORRELATION_LIMIT)
+strong_pairs_train.to_csv(TABLES_FOLDER / "block6_strong_correlation_pairs.csv", index=False)
+total_pairs = len(correlation_matrix_train.columns) * (len(correlation_matrix_train.columns) - 1) // 2
+print("Columns:", len(correlation_matrix_train.columns), "| pairs in total:", total_pairs)
+print("Pairs with |r| >", CORRELATION_LIMIT, ":", len(strong_pairs_train),
+      "(", round(len(strong_pairs_train) / total_pairs * 100, 2), "% of all pairs )")
+
+# How many different columns appear in at least one strong pair.
+columns_in_strong_pairs = set(strong_pairs_train["sensor_a"]).union(set(strong_pairs_train["sensor_b"]))
+print("Columns involved in at least one strong pair:", len(columns_in_strong_pairs))
+print("Ten strongest pairs:")
+print(strong_pairs_train.head(10).to_string(index=False))
+
+plot_correlation_heatmap(correlation_matrix_train,
+                         "Correlation heatmap, training set (" + str(len(strong_pairs_train))
+                         + " pairs with |r| > " + str(CORRELATION_LIMIT) + ", none removed)",
+                         "block6_01_correlation_heatmap_train.png")
+print("No columns removed; training columns remain:", X_train_reduced.shape[1])
+
+# %% Block 7: Outliers with the 3 sigma rule (training set only)
+# Flags extreme values per sensor with the 3 sigma rule and applies the chosen
+# treatment (decision D7) to the training set (manual Section 5; rule 4: no IQR).
+# The mean, standard deviation and bounds are computed on the training set only
+# and stored, so the same bounds can be applied to the test set in Block 17.
+# All three treatments are written as functions so the grid search (Block 15)
+# can compare them.
+
+
+def find_outliers(data, lower_bounds, upper_bounds):
+    """
+    Mark every value below its column's lower bound or above its upper bound.
+    Missing values are never marked (a comparison with NaN is always False).
+
+    Input:  data (DataFrame), lower_bounds and upper_bounds (Series: one bound per column)
+    Output: DataFrame of True/False with the same shape as data (True = outlier)
+    """
+    # axis="columns" lines each bound up with the column of the same name.
+    below = data.lt(lower_bounds, axis="columns")
+    above = data.gt(upper_bounds, axis="columns")
+    return below | above
+
+
+def treat_outliers_nothing(data, lower_bounds, upper_bounds):
+    """
+    Option "do nothing": keep every value as measured (the baseline).
+
+    Input:  data (DataFrame), lower_bounds and upper_bounds (Series; not used, kept so
+            all three options are called the same way)
+    Output: an unchanged copy of data
+    """
+    return data.copy()
+
+
+def treat_outliers_cap(data, lower_bounds, upper_bounds):
+    """
+    Option "cap" (winsorising): pull every value beyond a bound back to that bound.
+
+    Input:  data (DataFrame), lower_bounds and upper_bounds (Series: one bound per column)
+    Output: a copy of data with outliers replaced by the nearest bound
+    """
+    # clip() with axis=1 uses each column's own bounds; missing values stay missing.
+    return data.clip(lower=lower_bounds, upper=upper_bounds, axis=1)
+
+
+def treat_outliers_remove(data, lower_bounds, upper_bounds):
+    """
+    Option "remove": replace every outlier with a missing value (a gap that the
+    kNN imputation in Block 8 has to fill).
+
+    Input:  data (DataFrame), lower_bounds and upper_bounds (Series: one bound per column)
+    Output: a copy of data with outliers replaced by NaN
+    """
+    # mask() puts NaN wherever the outlier table is True.
+    return data.mask(find_outliers(data, lower_bounds, upper_bounds))
+
+
+def apply_outlier_treatment(option, data, lower_bounds, upper_bounds):
+    """
+    Apply one of the three outlier treatments by name.
+
+    Input:  option (str: "nothing", "cap" or "remove"), data (DataFrame),
+            lower_bounds and upper_bounds (Series: one bound per column)
+    Output: the treated copy of data
+    """
+    if option == "nothing":
+        return treat_outliers_nothing(data, lower_bounds, upper_bounds)
+    elif option == "cap":
+        return treat_outliers_cap(data, lower_bounds, upper_bounds)
+    elif option == "remove":
+        return treat_outliers_remove(data, lower_bounds, upper_bounds)
+    else:
+        raise ValueError("Unknown outlier treatment: " + str(option))
+
+
+# ----- 7.1 Bounds from the training set (stored for the test set) -----
+print("\n--- 7.1 Outlier bounds (training set) ---")
+# mean() and std() per column on the training set only. std() is the sample
+# standard deviation (pandas default ddof=1); both ignore missing values.
+training_means = X_train_reduced.mean()
+training_stds = X_train_reduced.std()
+lower_bounds = training_means - OUTLIER_SIGMA * training_stds
+upper_bounds = training_means + OUTLIER_SIGMA * training_stds
+bounds_table = pd.DataFrame({"mean": training_means, "std": training_stds,
+                             "lower_bound": lower_bounds, "upper_bound": upper_bounds})
+bounds_table.to_csv(TABLES_FOLDER / "block7_outlier_bounds.csv")
+print("Bounds stored for", len(bounds_table), "columns (mean +/-", OUTLIER_SIGMA, "standard deviations)")
+
+
+# ----- 7.2 How many values are flagged? -----
+print("\n--- 7.2 Flagged values (training set) ---")
+outlier_mask = find_outliers(X_train_reduced, lower_bounds, upper_bounds)
+flags_per_column = outlier_mask.sum()
+total_flagged = flags_per_column.sum()
+measured_values = X_train_reduced.notna().sum().sum()
+print("Values flagged:", total_flagged, "of", measured_values, "measured values (",
+      round(total_flagged / measured_values * 100, 2), "% )")
+# Under a perfect bell curve about 0.27 % of values lie beyond 3 sigma.
+print("Expected under a normal distribution (0.27 %):", round(measured_values * 0.0027))
+print("Sensors with at least one flagged value:", (flags_per_column > 0).sum(), "of",
+      X_train_reduced.shape[1])
+
+top10_outlier_sensors = flags_per_column.sort_values(ascending=False).head(10)
+print("Ten most affected sensors (flagged values):")
+print(top10_outlier_sensors)
+top10_outlier_sensors.to_csv(TABLES_FOLDER / "block7_top10_outlier_sensors.csv",
+                             header=["flagged_values"])
+
+# Are outliers more common in failed wafers? Count flags per wafer, then average
+# per class (training labels only, describing, nothing is fitted).
+flags_per_wafer = outlier_mask.sum(axis=1)
+flags_by_class = flags_per_wafer.groupby(y_train).mean()
+print("Average flagged values per wafer: pass", round(flags_by_class[0], 2),
+      "| fail", round(flags_by_class[1], 2))
+
+
+# ----- 7.3 Compare the three options, then apply the chosen one (D7) -----
+print("\n--- 7.3 Outlier treatment options (training set) ---")
+missing_before_treatment = X_train_reduced.isna().sum().sum()
+option_rows = []
+for option in ["nothing", "cap", "remove"]:
+    treated = apply_outlier_treatment(option, X_train_reduced, lower_bounds, upper_bounds)
+    # A value counts as changed if it differs from before; NaN != NaN is True in
+    # pandas, so cells missing before AND after are excluded.
+    both_missing = X_train_reduced.isna() & treated.isna()
+    values_changed = ((treated != X_train_reduced) & ~both_missing).sum().sum()
+    option_rows.append({"option": option,
+                        "values_changed": values_changed,
+                        "missing_before": missing_before_treatment,
+                        "missing_after": treated.isna().sum().sum()})
+options_table = pd.DataFrame(option_rows)
+print(options_table.to_string(index=False))
+options_table.to_csv(TABLES_FOLDER / "block7_outlier_options.csv", index=False)
+
+# Apply the chosen treatment to the training set. The stored bounds are applied
+# to the test set with the same function in Block 17.
+X_train_treated = apply_outlier_treatment(OUTLIER_TREATMENT, X_train_reduced, lower_bounds, upper_bounds)
+print("Chosen treatment:", OUTLIER_TREATMENT, "| training shape:", X_train_treated.shape,
+      "| missing values for Phase 2 to impute:", X_train_treated.isna().sum().sum())
+
+# Processed data: the training set after outlier capping, the input for Phase 2.
+save_processed(X_train_treated, y_train, "block7_train_capped.csv")
+
+
+# ----- 7.4 Before/after boxplot of the most affected sensor -----
+# The boxplot is only a picture: its whiskers follow the usual 1.5 x IQR drawing
+# convention, while outliers were detected with the 3 sigma bounds (dashed lines).
+example_sensor = flags_per_column.idxmax()
+values_before = X_train_reduced[example_sensor].dropna()
+values_after = X_train_treated[example_sensor].dropna()
+figure, axis = plt.subplots(figsize=(7, 4))
+axis.boxplot([values_before, values_after],
+             tick_labels=["Before", "After (" + OUTLIER_TREATMENT + ")"])
+axis.axhline(lower_bounds[example_sensor], linestyle="--", linewidth=1, color=COLOR_REFERENCE)
+axis.axhline(upper_bounds[example_sensor], linestyle="--", linewidth=1, color=COLOR_REFERENCE)
+axis.text(2.45, upper_bounds[example_sensor], "+3 sigma", va="bottom", ha="right", color=COLOR_REFERENCE)
+axis.text(2.45, lower_bounds[example_sensor], "-3 sigma", va="top", ha="right", color=COLOR_REFERENCE)
+axis.set_ylabel(example_sensor + " value")
+axis.set_title(example_sensor + ": " + str(flags_per_column[example_sensor])
+               + " flagged values, before and after treatment (training set)")
+axis.spines["top"].set_visible(False)
+axis.spines["right"].set_visible(False)
+save_figure(figure, "block7_01_outlier_boxplot_" + example_sensor + ".png")
+
+print("\nPhase 1 steps finished; Phase 2 starts.")
+
+
+# %% Block 8: Missing-value check, scaling and kNN imputation (training set only)
+# Phase 2 starts from the capped training set of Block 7. Before any value is
+# filled in, every gap must be a real missing value (NaN), because the imputer
+# only recognises NaN as missing (manual week 3; rule 5). Scaling and kNN
+# imputation follow in this block (Step 2.2). The test set is not used.
+
+# ----- 8.1 Missing values before imputation -----
+print("\n--- 8.1 Missing values before imputation (training set) ---")
+
+# Every column must be numeric: a text column would mean that something other
+# than "NaN" marked a gap, and the imputer could not handle it.
+non_numeric_columns = []
+for column in X_train_treated.columns:
+    if not pd.api.types.is_numeric_dtype(X_train_treated[column]):
+        non_numeric_columns.append(column)
+print("Non-numeric columns:", len(non_numeric_columns))
+
+# Infinite values (inf) are not counted as missing by isna() and would break the
+# distance calculation of kNN. np.isinf() returns False for NaN, so only real
+# infinities are counted.
+infinite_values = np.isinf(X_train_treated.to_numpy()).sum()
+print("Infinite values:", infinite_values)
+if len(non_numeric_columns) > 0 or infinite_values > 0:
+    raise ValueError("Some gaps are not flagged as NaN; check the data before imputation.")
+
+# The starting point for imputation: every gap is now a NaN. Capping (D7)
+# created no new gaps, so this equals the count after Block 5.
+missing_before_imputation = X_train_treated.isna().sum().sum()
+print("Missing values to impute:", missing_before_imputation, "of", X_train_treated.size,
+      "cells (", round(missing_before_imputation / X_train_treated.size * 100, 2), "% )")
+missing_percent_before = X_train_treated.isna().mean() * 100
+print("Columns with at least one missing value:", (missing_percent_before > 0).sum(),
+      "of", X_train_treated.shape[1])
+print("Ten columns with the most missing values (%):")
+print(missing_percent_before.sort_values(ascending=False).head(10).round(2))
+
+# ----- 8.2 Min-max scaling (decision D8, fitted on the training set only) -----
+print("\n--- 8.2 Min-max scaling (training set) ---")
+# kNN imputation measures distances across all sensors, so every sensor must be
+# on the same scale; otherwise sensors measured in thousands would decide alone
+# which wafers count as neighbours. MinMaxScaler maps each column to 0 to 1
+# (default feature_range=(0, 1)): (value - minimum) / (maximum - minimum).
+# fit() learns each column's minimum and maximum from the training set only;
+# missing values are ignored when learning and stay missing after transform().
+scaler = MinMaxScaler()
+scaler.fit(X_train_treated)
+X_train_scaled = pd.DataFrame(scaler.transform(X_train_treated),
+                              columns=X_train_treated.columns, index=X_train_treated.index)
+print("Scaled training values from", round(X_train_scaled.min().min(), 4), "to",
+      round(X_train_scaled.max().max(), 4), "| missing values still:", X_train_scaled.isna().sum().sum())
+
+
+# ----- 8.3 kNN imputation (decision D9, fitted on the training set only) -----
+print("\n--- 8.3 kNN imputation (training set) ---")
+# For each gap, KNNImputer finds the KNN_NEIGHBORS most similar training wafers
+# and fills the gap with their average value for that sensor. Defaults used:
+# weights="uniform" (all neighbours count equally) and metric="nan_euclidean"
+# (the distance between two wafers uses only the sensors both have measured).
+# fit() stores the scaled training wafers as the pool of possible neighbours.
+imputer = KNNImputer(n_neighbors=KNN_NEIGHBORS)
+imputer.fit(X_train_scaled)
+X_train_imputed = pd.DataFrame(imputer.transform(X_train_scaled),
+                               columns=X_train_scaled.columns, index=X_train_scaled.index)
+
+# Checks: no gap may remain, and every value that was measured must be unchanged
+# (only the gaps are filled). 1e-9 allows for tiny rounding differences.
+missing_after_imputation = X_train_imputed.isna().sum().sum()
+measured = X_train_scaled.notna()
+largest_change = (X_train_imputed[measured] - X_train_scaled[measured]).abs().max().max()
+print("Missing values: before", missing_before_imputation, "| after", missing_after_imputation)
+print("Largest change to a measured value:", largest_change)
+if missing_after_imputation != 0 or largest_change > 1e-9:
+    raise ValueError("Imputation check failed: gaps remain or measured values changed.")
+
+# The fitted scaler and imputer are the stored rules for the final evaluation
+# (Phase 3, Block 17): the test set will only get scaler.transform() and then
+# imputer.transform(); nothing is ever fitted on it. The test set is not used here.
+
+# Summary table and processed data (scaled 0 to 1, no gaps).
+imputation_summary = pd.DataFrame([{"scaling": "min-max (0 to 1), fitted on training set",
+                                    "imputation": "KNNImputer, k = " + str(KNN_NEIGHBORS) + ", uniform weights, nan_euclidean",
+                                    "training_wafers": X_train_imputed.shape[0],
+                                    "columns": X_train_imputed.shape[1],
+                                    "missing_before": missing_before_imputation,
+                                    "missing_after": missing_after_imputation}])
+imputation_summary.to_csv(TABLES_FOLDER / "block8_imputation_summary.csv", index=False)
+save_processed(X_train_imputed, y_train, "block8_train_imputed.csv")
+
+
+# ----- 8.4 Before/after histogram for the most incomplete sensor -----
+# The sensor with the most gaps shows the effect of imputation most clearly. The
+# imputed values are turned back into the sensor's original units with
+# inverse_transform(), only for this picture, so the axis is readable.
+example_sensor = missing_percent_before.idxmax()
+values_observed = X_train_treated[example_sensor].dropna()
+X_train_imputed_original_units = pd.DataFrame(scaler.inverse_transform(X_train_imputed),
+                                              columns=X_train_imputed.columns,
+                                              index=X_train_imputed.index)
+values_after = X_train_imputed_original_units[example_sensor]
+print("\n" + example_sensor + ":", round(missing_percent_before[example_sensor], 2), "% missing")
+print("  observed only:       n =", len(values_observed), "| mean", round(values_observed.mean(), 3),
+      "| std", round(values_observed.std(), 3))
+print("  observed + imputed:  n =", len(values_after), "| mean", round(values_after.mean(), 3),
+      "| std", round(values_after.std(), 3))
+
+# Same bins in both panels (np.linspace: 31 edges = 30 equal bins over the
+# observed range), so the two histograms can be compared directly.
+bin_edges = np.linspace(values_after.min(), values_after.max(), 31)
+figure, (axis_left, axis_right) = plt.subplots(1, 2, figsize=(10, 4), sharey=True)
+axis_left.hist(values_observed, bins=bin_edges, color=COLOR_MAIN, edgecolor="white")
+axis_left.set_title("Before: observed only (n = " + str(len(values_observed)) + ")")
+axis_right.hist(values_after, bins=bin_edges, color=COLOR_MAIN, edgecolor="white")
+axis_right.set_title("After: observed + imputed (n = " + str(len(values_after)) + ")")
+axis_left.set_ylabel("Number of training wafers")
+for axis in [axis_left, axis_right]:
+    axis.set_xlabel(example_sensor + " value (original units)")
+    axis.spines["top"].set_visible(False)
+    axis.spines["right"].set_visible(False)
+figure.suptitle(example_sensor + " (" + str(round(missing_percent_before[example_sensor], 1))
+                + " % missing): kNN imputation, k = " + str(KNN_NEIGHBORS))
+save_figure(figure, "block8_01_imputation_check_" + example_sensor + ".png")
+
+
+# %% Block 9: First random forest - training fit vs. cross-validation
+# Trains a first random forest on the imputed training data (manual week 3,
+# step 5; Section 11.2) and evaluates it twice: on the same wafers it learned
+# from (training fit) and with 5-fold stratified cross-validation, where every
+# wafer is predicted by a model that never saw it. Only the training set is
+# used; the test set stays locked.
+
+
+def evaluate_predictions(y_true, y_pred):
+    """
+    Compute the confusion matrix, the usual metrics and the total cost.
+
+    Input:  y_true (Series or array of true labels, 1 = fail), y_pred (predicted labels)
+    Output: dictionary with TN, FP, FN, TP, accuracy, recall, precision,
+            specificity, F1 and total cost in euros
+    """
+    # labels=[0, 1] fixes the order (pass, fail) and keeps a 2 x 2 matrix even
+    # if one class is never predicted. ravel() reads it as TN, FP, FN, TP.
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    total = tn + fp + fn + tp
+    # Each ratio is set to 0 when its denominator is 0 (for example precision
+    # when no wafer is predicted as failed), instead of dividing by zero.
+    accuracy = (tp + tn) / total
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    cost = COST_FALSE_POSITIVE * fp + COST_FALSE_NEGATIVE * fn
+    # int() and float() turn numpy numbers into plain Python numbers, so they print cleanly.
+    return {"TN": int(tn), "FP": int(fp), "FN": int(fn), "TP": int(tp),
+            "accuracy": round(float(accuracy), 4), "recall": round(float(recall), 4),
+            "precision": round(float(precision), 4), "specificity": round(float(specificity), 4),
+            "F1": round(float(f1), 4), "cost_eur": int(cost)}
+
+
+# ----- 9.1 Training fit: the model is scored on the wafers it learned from -----
+print("\n--- 9.1 Random forest, training fit ---")
+# Defaults used (scikit-learn 1.9.1): n_estimators=100 trees; max_features="sqrt"
+# (each split chooses among about 21 of the 450 sensors); bootstrap=True (each
+# tree learns from a random sample of wafers drawn with replacement); no depth
+# limit; no class weights. random_state=SEED makes the forest identical on every run.
+random_forest = RandomForestClassifier(random_state=SEED)
+random_forest.fit(X_train_imputed, y_train)
+# predict() calls a wafer "fail" when more than half of the trees vote fail (threshold 0.5).
+training_fit_results = evaluate_predictions(y_train, random_forest.predict(X_train_imputed))
+print(training_fit_results)
+
+
+# ----- 9.2 5-fold stratified cross-validation (a visible loop inside a function) -----
+print("\n--- 9.2 Random forest, " + str(CV_FOLDS) + "-fold stratified cross-validation ---")
+# StratifiedKFold cuts the training wafers into CV_FOLDS parts with the same
+# failure share. shuffle=True mixes the wafers first (they are in time order);
+# random_state=SEED makes the parts identical on every run, so every model in
+# this script is evaluated on exactly the same five parts.
+cv_splitter = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=SEED)
+
+
+def balance_training_data(option, X_data, y_data):
+    """
+    Balance training data with one of the options screened in Block 11.
+    Only ever called on training data (inside a training fold or on the
+    training set), never on data that is evaluated.
+
+    Input:  option (str: "none", "class_weight", "SMOTE", "ROSE" or "ADASYN"),
+            X_data (DataFrame of training features), y_data (Series of training labels)
+    Output: X_balanced (DataFrame), y_balanced (Series), class_weight (None or
+            "balanced", the setting for the random forest)
+    """
+    # "none" and "class_weight" create no new wafers; class weights are handled by the model.
+    if option == "none":
+        return X_data, y_data, None
+    if option == "class_weight":
+        return X_data, y_data, "balanced"
+    # sampling_strategy="auto" (default) adds failed wafers until both classes
+    # are equally large; random_state=SEED makes the new wafers repeatable.
+    if option == "SMOTE":
+        # k_neighbors=5 (default): a new wafer lies between a failed wafer and
+        # one of its 5 nearest failed neighbours.
+        sampler = SMOTE(random_state=SEED)
+    elif option == "ROSE":
+        # A smoothed bootstrap: copy a random failed wafer and add a little
+        # random noise; shrinkage sets how much (1.0 = ROSE's default rule).
+        sampler = RandomOverSampler(shrinkage=ROSE_SHRINKAGE, random_state=SEED)
+    elif option == "ADASYN":
+        # n_neighbors=5 (default): like SMOTE, but more new wafers where failed
+        # wafers are surrounded by passed ones.
+        sampler = ADASYN(random_state=SEED)
+    else:
+        raise ValueError("Unknown balancing option: " + str(option))
+    X_balanced, y_balanced = sampler.fit_resample(X_data, y_data)
+    # The original wafers come first, the new ones are appended; the original
+    # wafer numbers are kept and the new rows are named synthetic_1, synthetic_2, ...
+    new_index = list(X_data.index)
+    for number in range(1, len(X_balanced) - len(X_data) + 1):
+        new_index.append("synthetic_" + str(number))
+    X_balanced.index = new_index
+    y_balanced = pd.Series(np.asarray(y_balanced), index=new_index, name=y_data.name)
+    return X_balanced, y_balanced, None
+
+
+def cross_validate_random_forest(X_data, y_data, balancing="none"):
+    """
+    Evaluate a random forest (seed SEED, default settings) with the stratified
+    cross-validation parts of cv_splitter: for each part, a new forest learns
+    from the other parts and predicts this one, so every wafer is predicted
+    exactly once by a model that never saw it. If a balancing option is given,
+    only the training part of each fold is balanced; the part that is
+    evaluated keeps its real class mix.
+
+    Input:  X_data (DataFrame of training features), y_data (Series of training labels),
+            balancing (str, default "none": see balance_training_data)
+    Output: fold_table (DataFrame: one row of results per part),
+            cv_predictions (Series: out-of-fold predicted class per wafer),
+            cv_probabilities (Series: out-of-fold predicted failure probability per wafer)
+    """
+    cv_predictions = pd.Series(0, index=y_data.index)
+    cv_probabilities = pd.Series(0.0, index=y_data.index)
+    fold_rows = []
+    fold_number = 0
+    for train_positions, validation_positions in cv_splitter.split(X_data, y_data):
+        fold_number = fold_number + 1
+        # iloc selects rows by position: 4 parts to learn from, 1 part to evaluate on.
+        X_fold_train = X_data.iloc[train_positions]
+        y_fold_train = y_data.iloc[train_positions]
+        X_fold_validation = X_data.iloc[validation_positions]
+        y_fold_validation = y_data.iloc[validation_positions]
+
+        # Balance the training part only (rule 8); the validation part is left as it is.
+        X_fold_balanced, y_fold_balanced, class_weight = balance_training_data(balancing, X_fold_train, y_fold_train)
+
+        # A new forest with the same settings for every part, trained without the validation part.
+        fold_model = RandomForestClassifier(random_state=SEED, class_weight=class_weight)
+        fold_model.fit(X_fold_balanced, y_fold_balanced)
+        fold_predictions = fold_model.predict(X_fold_validation)
+        # predict_proba() gives [P(pass), P(fail)] per wafer; column 1 is the share of trees voting fail.
+        fold_probabilities = fold_model.predict_proba(X_fold_validation)[:, 1]
+
+        cv_predictions.loc[X_fold_validation.index] = fold_predictions
+        cv_probabilities.loc[X_fold_validation.index] = fold_probabilities
+        fold_result = evaluate_predictions(y_fold_validation, fold_predictions)
+        fold_result["fold"] = fold_number
+        fold_result["validation_wafers"] = len(y_fold_validation)
+        fold_result["failed_wafers"] = int(y_fold_validation.sum())
+        fold_rows.append(fold_result)
+
+    fold_table = pd.DataFrame(fold_rows)
+    fold_table = fold_table[["fold", "validation_wafers", "failed_wafers", "TN", "FP", "FN", "TP",
+                             "accuracy", "recall", "precision", "cost_eur"]]
+    return fold_table, cv_predictions, cv_probabilities
+
+
+fold_table, cv_predictions, cv_probabilities = cross_validate_random_forest(X_train_imputed, y_train)
+print(fold_table.to_string(index=False))
+fold_table.to_csv(TABLES_FOLDER / "block9_cv_folds.csv", index=False)
+
+# All five validation parts together: every training wafer predicted once by a model that never saw it.
+cross_validation_results = evaluate_predictions(y_train, cv_predictions)
+print("All folds together:", cross_validation_results)
+print("Highest predicted failure probability:", round(cv_probabilities.max(), 3),
+      "| wafers with probability >= 0.5:", (cv_probabilities >= 0.5).sum(),
+      "| >= 0.3:", (cv_probabilities >= 0.3).sum())
+
+
+# ----- 9.3 Side by side: training fit vs. cross-validation -----
+comparison_table = pd.DataFrame([training_fit_results, cross_validation_results],
+                                index=["training fit (seen wafers)",
+                                       str(CV_FOLDS) + "-fold CV (unseen wafers)"])
+print("\n" + comparison_table.to_string())
+comparison_table.to_csv(TABLES_FOLDER / "block9_train_vs_cv.csv", index_label="evaluation")
+
+# Two confusion matrices side by side. Rows = true class, columns = predicted
+# class; each cell shows its count. One blue scale for both (vmin/vmax fixed).
+figure, axes = plt.subplots(1, 2, figsize=(10, 4.5))
+panel_results = [training_fit_results, cross_validation_results]
+panel_titles = ["Training fit (wafers the model has seen)",
+                str(CV_FOLDS) + "-fold CV (wafers the model has not seen)"]
+for position in range(2):
+    result = panel_results[position]
+    matrix = np.array([[result["TN"], result["FP"]], [result["FN"], result["TP"]]])
+    axis = axes[position]
+    axis.imshow(matrix, cmap="Blues", vmin=0, vmax=len(y_train))
+    cell_labels = [["TN", "FP"], ["FN", "TP"]]
+    for row in range(2):
+        for column in range(2):
+            count = matrix[row, column]
+            # Dark cells get white text, light cells dark text, so every number stays readable.
+            text_color = "white" if count > len(y_train) / 2 else "#222222"
+            axis.text(column, row, cell_labels[row][column] + "\n" + str(count),
+                      ha="center", va="center", fontsize=13, color=text_color)
+    axis.set_xticks([0, 1])
+    axis.set_xticklabels(["Pass (0)", "Fail (1)"])
+    axis.set_yticks([0, 1])
+    axis.set_yticklabels(["Pass (0)", "Fail (1)"])
+    axis.set_xlabel("Predicted class")
+    axis.set_ylabel("True class")
+    axis.set_title(panel_titles[position] + "\nrecall " + str(result["recall"])
+                   + " | accuracy " + str(result["accuracy"]) + " | cost EUR " + format(result["cost_eur"], ","),
+                   fontsize=10)
+figure.suptitle("First random forest on the training set (" + str(len(y_train)) + " wafers, "
+                + str(int(y_train.sum())) + " failed)")
+# Extra space between the panels and below the main title so no labels overlap.
+figure.subplots_adjust(top=0.80, wspace=0.45)
+save_figure(figure, "block9_01_confusion_matrices.png")
+
+# %% Block 10: Boruta feature selection (training set only)
+# Keeps only the sensors that predict failure better than chance (manual week 4;
+# Section 7). Boruta compares every sensor with shuffled "shadow" copies over
+# many random-forest rounds and confirms, rejects or leaves it tentative.
+# It uses the label, so it is fitted on X_train_imputed / y_train only; the
+# list of selected sensors is the stored rule applied to the test set in Block 17.
+
+# ----- 10.1 Run Boruta -----
+print("\n--- 10.1 Boruta feature selection (training set) ---")
+# The forest inside Boruta: class_weight="balanced" weights each failed wafer by
+# about 1,170 / 83 so the few failures count as much as the many passes;
+# max_depth=5 keeps the trees shallow, as the Boruta documentation recommends,
+# which gives steadier importances; n_jobs=None (default) runs on one processor
+# thread: about 25 s slower than all cores, but the same result and no
+# multi-threading warnings (DEBUG_LOG.md, 20 Oct); random_state=SEED makes it repeatable.
+boruta_forest = RandomForestClassifier(class_weight="balanced", max_depth=5,
+                                       n_jobs=None, random_state=SEED)
+# n_estimators="auto" lets Boruta choose the number of trees from the number of
+# columns. Defaults kept: perc=100 (a sensor must beat the BEST shadow), alpha=0.05
+# (significance level), two_step=True (test corrected for testing 450 sensors).
+boruta_selector = BorutaPy(boruta_forest, n_estimators="auto", max_iter=BORUTA_MAX_ITER,
+                           random_state=SEED, verbose=0)
+# BorutaPy expects plain arrays, so .to_numpy() is passed; fitted on training data only.
+boruta_selector.fit(X_train_imputed.to_numpy(), y_train.to_numpy())
+
+# support_ marks confirmed sensors, support_weak_ tentative ones; all others are rejected.
+confirmed_features = X_train_imputed.columns[boruta_selector.support_].tolist()
+tentative_features = X_train_imputed.columns[boruta_selector.support_weak_].tolist()
+rejected_count = X_train_imputed.shape[1] - len(confirmed_features) - len(tentative_features)
+print("Confirmed:", len(confirmed_features), confirmed_features)
+print("Tentative:", len(tentative_features), tentative_features)
+print("Rejected: ", rejected_count)
+
+# Decision D10: the stored rule for the test set is this list of sensor names.
+selected_features = list(confirmed_features)
+if KEEP_TENTATIVE:
+    selected_features = selected_features + tentative_features
+print("Selected (KEEP_TENTATIVE =", str(KEEP_TENTATIVE) + "):", len(selected_features), "features")
+
+
+# ----- 10.2 Ranking table and chart -----
+# importance_history_ holds each sensor's importance in every round (missing once
+# a sensor is rejected); the median over the rounds summarises it robustly.
+median_importance = pd.Series(np.nanmedian(boruta_selector.importance_history_, axis=0),
+                              index=X_train_imputed.columns)
+status = pd.Series("rejected", index=X_train_imputed.columns)
+status[confirmed_features] = "confirmed"
+status[tentative_features] = "tentative"
+ranking_table = pd.DataFrame({"boruta_rank": boruta_selector.ranking_,
+                              "status": status,
+                              "median_importance": median_importance.round(6)})
+ranking_table = ranking_table.sort_values(["boruta_rank", "median_importance"], ascending=[True, False])
+ranking_table.to_csv(TABLES_FOLDER / "block10_boruta_ranking.csv", index_label="sensor")
+
+# Horizontal bar chart of the 30 highest-ranked sensors, coloured by status
+# (green confirmed, yellow tentative, grey rejected), most important at the top.
+top_ranked = ranking_table.head(30).iloc[::-1]
+status_colors = {"confirmed": "#008300", "tentative": "#eda100", "rejected": "#a6a6a6"}
+bar_colors = []
+for sensor_status in top_ranked["status"]:
+    bar_colors.append(status_colors[sensor_status])
+figure, axis = plt.subplots(figsize=(8, 8))
+axis.barh(top_ranked.index, top_ranked["median_importance"], color=bar_colors)
+# Legend: one coloured square (Patch) per status.
+legend_handles = []
+for sensor_status in ["confirmed", "tentative", "rejected"]:
+    legend_handles.append(Patch(color=status_colors[sensor_status], label=sensor_status))
+axis.legend(handles=legend_handles, loc="lower right")
+axis.set_xlabel("Median importance over Boruta rounds")
+axis.set_title("Boruta ranking, training set: " + str(len(confirmed_features)) + " confirmed, "
+               + str(len(tentative_features)) + " tentative, " + str(rejected_count) + " rejected\n"
+               + "(30 highest-ranked of " + str(X_train_imputed.shape[1]) + " sensors)")
+axis.spines["top"].set_visible(False)
+axis.spines["right"].set_visible(False)
+save_figure(figure, "block10_01_boruta_ranking.png")
+
+
+# ----- 10.3 Random forest with the selected sensors vs. Block 9 -----
+print("\n--- 10.3 Cross-validated random forest: all vs. selected sensors ---")
+# The same function, the same five parts and the same forest settings as in
+# Block 9, so the only difference between the rows is the set of sensors.
+feature_sets = {"all sensors (Block 9)": list(X_train_imputed.columns),
+                "Boruta confirmed only": confirmed_features,
+                "Boruta selected (D10)": selected_features}
+comparison_rows = []
+for set_name in feature_sets:
+    columns = feature_sets[set_name]
+    folds, predictions, probabilities = cross_validate_random_forest(X_train_imputed[columns], y_train)
+    row = evaluate_predictions(y_train, predictions)
+    row["feature_set"] = set_name
+    row["features"] = len(columns)
+    row["highest_fail_probability"] = round(float(probabilities.max()), 3)
+    row["wafers_at_or_above_0.3"] = int((probabilities >= 0.3).sum())
+    comparison_rows.append(row)
+selection_comparison = pd.DataFrame(comparison_rows)
+selection_comparison = selection_comparison[["feature_set", "features", "TN", "FP", "FN", "TP",
+                                             "accuracy", "recall", "precision", "cost_eur",
+                                             "highest_fail_probability", "wafers_at_or_above_0.3"]]
+print(selection_comparison.to_string(index=False))
+selection_comparison.to_csv(TABLES_FOLDER / "block10_cv_comparison.csv", index=False)
+
+# Processed data: the training set with only the selected sensors (scaled, imputed).
+X_train_selected = X_train_imputed[selected_features]
+save_processed(X_train_selected, y_train, "block10_train_selected.csv")
+
+# %% Block 11: Class imbalance - screening five balancing options (training set only)
+# With 1,170 passed and 83 failed training wafers, a model can be right 93 % of
+# the time by ignoring failures. Balancing changes what the model learns from
+# (manual Section 9). Five options are screened on the random forest with the
+# 18 Boruta sensors and the same five CV parts, balancing only the training
+# part of each fold (rule 8). ADASYN may be dropped only by the drop rule fixed
+# in advance (DECISIONS.md, 20 Oct); the working choice is decision D11.
+# The test set is never balanced and is not used here.
+
+# ----- 11.1 Class counts before and after balancing (whole training set, for the chart) -----
+print("\n--- 11.1 Class counts before and after balancing (training set) ---")
+count_rows = [{"version": "original", "pass": int((y_train == 0).sum()), "fail": int((y_train == 1).sum())}]
+for option in ["SMOTE", "ROSE", "ADASYN"]:
+    X_balanced, y_balanced, unused_weight = balance_training_data(option, X_train_selected, y_train)
+    count_rows.append({"version": option, "pass": int((y_balanced == 0).sum()), "fail": int((y_balanced == 1).sum())})
+class_counts_table = pd.DataFrame(count_rows)
+print(class_counts_table.to_string(index=False))
+print("class_weight: no new wafers; each failed wafer counts about",
+      round((y_train == 0).sum() / (y_train == 1).sum(), 1), "times as much in training")
+
+# Grouped bars: pass and fail count per version, each bar labelled with its number.
+figure, axis = plt.subplots(figsize=(8, 4.5))
+positions = np.arange(len(class_counts_table))
+bar_width = 0.38
+axis.bar(positions - bar_width / 2, class_counts_table["pass"], bar_width, color=COLOR_PASS, label="Pass (0)")
+axis.bar(positions + bar_width / 2, class_counts_table["fail"], bar_width, color=COLOR_FAIL, label="Fail (1)")
+for position in positions:
+    axis.text(position - bar_width / 2, class_counts_table["pass"][position],
+              str(class_counts_table["pass"][position]), ha="center", va="bottom", fontsize=9)
+    axis.text(position + bar_width / 2, class_counts_table["fail"][position],
+              str(class_counts_table["fail"][position]), ha="center", va="bottom", fontsize=9)
+axis.set_xticks(positions)
+axis.set_xticklabels(["Original", "SMOTE", "ROSE", "ADASYN"])
+axis.set_ylabel("Training wafers")
+axis.set_title("Class counts before and after balancing (training set only; test set never balanced)")
+axis.legend()
+axis.spines["top"].set_visible(False)
+axis.spines["right"].set_visible(False)
+save_figure(figure, "block11_01_class_counts.png")
+
+
+# ----- 11.2 Screening: five options, same folds, balancing inside each training fold -----
+print("\n--- 11.2 Screening five balancing options (random forest, 18 sensors, 5-fold CV) ---")
+balancing_options = ["none", "class_weight", "SMOTE", "ROSE", "ADASYN"]
+fold_costs = {}
+fold_rows_all = []
+total_rows = []
+for option in balancing_options:
+    folds, predictions, probabilities = cross_validate_random_forest(X_train_selected, y_train, option)
+    fold_costs[option] = folds["cost_eur"].to_numpy()
+    for row_number in range(len(folds)):
+        fold_rows_all.append({"option": option, "fold": int(folds["fold"][row_number]),
+                              "cost_eur": int(folds["cost_eur"][row_number]),
+                              "recall": folds["recall"][row_number],
+                              "TP": int(folds["TP"][row_number]), "FP": int(folds["FP"][row_number])})
+    total_row = evaluate_predictions(y_train, predictions)
+    total_row["option"] = option
+    total_row["mean_cost_per_fold"] = round(float(folds["cost_eur"].mean()), 1)
+    total_row["std_cost_per_fold"] = round(float(folds["cost_eur"].std()), 1)
+    total_rows.append(total_row)
+
+balancing_folds_table = pd.DataFrame(fold_rows_all)
+balancing_folds_table.to_csv(TABLES_FOLDER / "block11_balancing_folds.csv", index=False)
+balancing_comparison = pd.DataFrame(total_rows)
+balancing_comparison = balancing_comparison[["option", "TN", "FP", "FN", "TP", "recall", "precision",
+                                             "specificity", "F1", "cost_eur",
+                                             "mean_cost_per_fold", "std_cost_per_fold"]]
+print(balancing_comparison.to_string(index=False))
+balancing_comparison.to_csv(TABLES_FOLDER / "block11_balancing_comparison.csv", index=False)
+print("Cost per fold (EUR):")
+for option in balancing_options:
+    # tolist() turns the numpy array into plain Python numbers for printing.
+    print("  " + option.ljust(13), fold_costs[option].tolist())
+
+# Line chart: cost of every option in every fold, so stability is visible.
+option_colors = {"none": "#a6a6a6", "class_weight": "#2a78d6", "SMOTE": "#eb6834",
+                 "ROSE": "#1baf7a", "ADASYN": "#6250d6"}
+fold_numbers = np.arange(1, CV_FOLDS + 1)
+figure, axis = plt.subplots(figsize=(8, 4.5))
+for option in balancing_options:
+    axis.plot(fold_numbers, fold_costs[option] / 1000, marker="o", linewidth=2,
+              color=option_colors[option], label=option)
+axis.set_xticks(fold_numbers)
+axis.set_xlabel("Cross-validation fold")
+axis.set_ylabel("Cost in the fold (thousand EUR)")
+axis.set_title("Balancing options: cost per fold (random forest, 18 sensors, training set)")
+axis.legend(ncol=5, loc="upper center", bbox_to_anchor=(0.5, -0.15), frameon=False)
+axis.spines["top"].set_visible(False)
+axis.spines["right"].set_visible(False)
+save_figure(figure, "block11_02_cost_per_fold.png")
+
+
+# ----- 11.3 Drop rule for ADASYN (fixed in advance) -----
+print("\n--- 11.3 ADASYN drop rule ---")
+# The best option is the one with the lowest total cross-validated cost.
+total_costs = balancing_comparison.set_index("option")["cost_eur"]
+best_option = total_costs.idxmin()
+print("Best option (lowest total cost):", best_option)
+
+# A neighbour search over the real training wafers (18 sensors), used without
+# any model to see where failed wafers lie. Default distance: Euclidean.
+neighbour_finder = NearestNeighbors(n_neighbors=5)
+neighbour_finder.fit(X_train_selected)
+
+# For context: for each real failed wafer, the share of passed wafers among its
+# 5 nearest other wafers (6 neighbours are asked for, because the nearest one
+# is the wafer itself at distance 0 and is skipped).
+distances, neighbour_positions = neighbour_finder.kneighbors(X_train_selected[y_train == 1], n_neighbors=6)
+real_pass_neighbours = (y_train.to_numpy()[neighbour_positions[:, 1:]] == 0).mean()
+print("Real failed wafers: average share of passed wafers among their 5 nearest neighbours:",
+      round(float(real_pass_neighbours), 3))
+
+if best_option == "ADASYN":
+    condition_1 = False
+    condition_2 = False
+    condition_3 = False
+    print("ADASYN is itself the best option, so it cannot be dropped.")
+else:
+    # Fold-by-fold cost differences ADASYN minus best option (positive = ADASYN worse).
+    differences = fold_costs["ADASYN"] - fold_costs[best_option]
+    worse_folds = int((differences > 0).sum())
+    mean_difference = float(differences.mean())
+    std_difference = float(differences.std(ddof=1))
+    # Condition 1: worse in at least 4 of the 5 folds.
+    condition_1 = worse_folds >= 4
+    # Condition 2: worse on average by more than the fold-to-fold noise
+    # (sample standard deviation of the differences, ddof=1).
+    condition_2 = mean_difference > std_difference
+    print("Condition 1 - worse in at least 4 of 5 folds:", condition_1, "(worse in", worse_folds, "folds)")
+    print("Condition 2 - mean difference > std of differences:", condition_2,
+          "(mean", round(mean_difference), "EUR, std", round(std_difference), "EUR)")
+
+    # Condition 3, measured without any model: where do the synthetic failed
+    # wafers land? For each synthetic wafer, count how many of its 5 nearest
+    # real training wafers are passed wafers. If ADASYN puts more synthetic
+    # failures deep inside passed regions (4 or 5 of 5 neighbours passed) than
+    # SMOTE does, the reason would come from the data and apply to every model.
+    deep_in_pass_share = {}
+    for option in ["SMOTE", "ADASYN"]:
+        X_balanced, y_balanced, unused_weight = balance_training_data(option, X_train_selected, y_train)
+        synthetic_rows = X_balanced.iloc[len(X_train_selected):]
+        distances, neighbour_positions = neighbour_finder.kneighbors(synthetic_rows)
+        pass_neighbour_counts = (y_train.to_numpy()[neighbour_positions] == 0).sum(axis=1)
+        deep_in_pass_share[option] = float((pass_neighbour_counts >= 4).mean())
+        print("  " + option + ": share of synthetic failed wafers with >= 4 of 5 passed neighbours:",
+              round(deep_in_pass_share[option], 3))
+    condition_3 = deep_in_pass_share["ADASYN"] > deep_in_pass_share["SMOTE"]
+    print("Condition 3 - data-based reason (ADASYN deeper in passed regions than SMOTE):", condition_3)
+
+drop_adasyn = condition_1 and condition_2 and condition_3
+options_for_phase3 = list(balancing_options)
+if drop_adasyn:
+    options_for_phase3.remove("ADASYN")
+print("ADASYN dropped:", drop_adasyn, "| options continuing to Phase 3:", options_for_phase3)
+
+
+# ----- 11.4 Working choice for Phase 2 (decision D11) -----
+print("\n--- 11.4 Working choice (D11) ---")
+print("Setting BALANCING_METHOD:", BALANCING_METHOD, "| screening winner:", best_option)
+if BALANCING_METHOD != best_option:
+    print("Note: the setting differs from the screening winner; check decision D11.")
+
+# Processed data: the whole training set balanced with the working choice
+# (original wafers keep their wafer_id; new wafers are named synthetic_...).
+X_train_balanced, y_train_balanced, working_class_weight = balance_training_data(
+    BALANCING_METHOD, X_train_selected, y_train)
+print("Training set after", BALANCING_METHOD + ":", int((y_train_balanced == 0).sum()), "pass /",
+      int((y_train_balanced == 1).sum()), "fail")
+save_processed(X_train_balanced, y_train_balanced, "block11_train_balanced_" + BALANCING_METHOD.lower() + ".csv")
+
+# %% Block 12: Evaluation helpers and detailed assessment of the current best model
+# Functions that turn true labels, predicted labels and predicted failure
+# probabilities into the confusion matrix (as a figure), accuracy, recall,
+# specificity, precision, F1, F2, ROC-AUC with the ROC curve, and total cost
+# (manual week 4 step 4; Section 13). They are applied to the cross-validated
+# predictions of the current best model: random forest + 18 Boruta sensors +
+# ROSE inside each training fold. The test set stays locked (used once, Phase 3).
+
+
+def full_evaluation(y_true, y_pred, probabilities):
+    """
+    All metrics for one set of predictions: the confusion-matrix values,
+    accuracy, recall, specificity, precision, F1 and cost from
+    evaluate_predictions (Block 9), plus F2 and ROC-AUC.
+
+    Input:  y_true (true labels, 1 = fail), y_pred (predicted labels),
+            probabilities (predicted failure probabilities, same order)
+    Output: dictionary with all values
+    """
+    result = evaluate_predictions(y_true, y_pred)
+    precision = result["precision"]
+    recall = result["recall"]
+    # F2 weights recall twice as much as precision: 5PR / (4P + R).
+    if 4 * precision + recall > 0:
+        result["F2"] = round(5 * precision * recall / (4 * precision + recall), 4)
+    else:
+        result["F2"] = 0.0
+    # ROC-AUC uses the probabilities, not the 0.5 decision: the chance that a
+    # random failed wafer gets a higher failure probability than a random passed one.
+    result["ROC_AUC"] = round(float(roc_auc_score(y_true, probabilities)), 4)
+    return result
+
+
+def plot_confusion_matrix(y_true, y_pred, title, file_name):
+    """
+    Draw a labelled confusion matrix (rows = true class, columns = predicted
+    class) with the count and the cost of each cell, and save it.
+
+    Input:  y_true (true labels), y_pred (predicted labels), title (str), file_name (str)
+    Output: none (the figure is saved)
+    """
+    result = evaluate_predictions(y_true, y_pred)
+    matrix = np.array([[result["TN"], result["FP"]], [result["FN"], result["TP"]]])
+    cell_names = [["TN\ngood wafer passed", "FP (Type I error)\ngood wafer flagged"],
+                  ["FN (Type II error)\nfailed wafer missed", "TP\nfailed wafer caught"]]
+    cell_costs = [[0, COST_FALSE_POSITIVE], [COST_FALSE_NEGATIVE, 0]]
+    figure, axis = plt.subplots(figsize=(7, 5.5))
+    # One blue scale from 0 to the number of wafers, so cells are comparable.
+    axis.imshow(matrix, cmap="Blues", vmin=0, vmax=matrix.sum())
+    for row in range(2):
+        for column in range(2):
+            count = matrix[row, column]
+            cell_cost = count * cell_costs[row][column]
+            text_color = "white" if count > matrix.sum() / 2 else "#222222"
+            axis.text(column, row, cell_names[row][column] + "\n" + str(count)
+                      + "\ncost EUR " + format(int(cell_cost), ","),
+                      ha="center", va="center", fontsize=10, color=text_color)
+    axis.set_xticks([0, 1])
+    axis.set_xticklabels(["Predicted pass (0)", "Predicted fail (1)"])
+    axis.set_yticks([0, 1])
+    axis.set_yticklabels(["True pass (0)", "True fail (1)"])
+    axis.set_title(title + "\nrecall " + str(result["recall"]) + " | precision " + str(result["precision"])
+                   + " | total cost EUR " + format(result["cost_eur"], ","), fontsize=10)
+    save_figure(figure, file_name)
+
+
+def plot_roc_curve(y_true, probabilities, y_pred, title, file_name):
+    """
+    Draw the ROC curve (true-positive rate against false-positive rate over
+    all thresholds) with its AUC, the diagonal of a random guess, and the
+    point of the actual predictions, and save it.
+
+    Input:  y_true (true labels), probabilities (predicted failure probabilities),
+            y_pred (predicted labels, marked as one point), title (str), file_name (str)
+    Output: none (the figure is saved)
+    """
+    # roc_curve() tries every threshold and returns the false-positive rate
+    # (1 - specificity) and the true-positive rate (recall) for each.
+    false_positive_rate, true_positive_rate, thresholds = roc_curve(y_true, probabilities)
+    auc = roc_auc_score(y_true, probabilities)
+    result = evaluate_predictions(y_true, y_pred)
+    figure, axis = plt.subplots(figsize=(6, 6))
+    axis.plot(false_positive_rate, true_positive_rate, linewidth=2, color=COLOR_MAIN,
+              label="Model (AUC = " + str(round(auc, 3)) + ")")
+    axis.plot([0, 1], [0, 1], linestyle="--", color=COLOR_REFERENCE, label="Random guess (AUC = 0.5)")
+    axis.plot(1 - result["specificity"], result["recall"], marker="o", markersize=9, color=COLOR_FAIL,
+              linestyle="none", label="Threshold 0.5 (recall " + str(result["recall"]) + ")")
+    axis.set_xlabel("False-positive rate (good wafers flagged)")
+    axis.set_ylabel("True-positive rate = recall (failed wafers caught)")
+    axis.set_title(title, fontsize=10)
+    axis.legend(loc="lower right")
+    axis.spines["top"].set_visible(False)
+    axis.spines["right"].set_visible(False)
+    save_figure(figure, file_name)
+
+
+# ----- 12.1 Cross-validated predictions of the current best model -----
+print("\n--- 12.1 Detailed assessment: random forest + 18 sensors + " + BALANCING_METHOD + " (5-fold CV) ---")
+# Same function, same five parts as Blocks 9 to 11. Every probability comes
+# from a model that did not see that wafer; balancing only in the training parts.
+best_folds, best_predictions, best_probabilities = cross_validate_random_forest(
+    X_train_selected, y_train, BALANCING_METHOD)
+no_balancing_folds, no_balancing_predictions, no_balancing_probabilities = cross_validate_random_forest(
+    X_train_selected, y_train, "none")
+
+metric_rows = []
+for name, predictions, probabilities in [
+        ("RF + 18 sensors, no balancing", no_balancing_predictions, no_balancing_probabilities),
+        ("RF + 18 sensors + " + BALANCING_METHOD, best_predictions, best_probabilities)]:
+    row = full_evaluation(y_train, predictions, probabilities)
+    row["model"] = name
+    metric_rows.append(row)
+metrics_table = pd.DataFrame(metric_rows)
+metrics_table = metrics_table[["model", "TN", "FP", "FN", "TP", "accuracy", "recall", "specificity",
+                               "precision", "F1", "F2", "ROC_AUC", "cost_eur"]]
+print(metrics_table.to_string(index=False))
+# Build the file name first: "/" (join a folder and a name) is applied before
+# "+", so joining and adding text in one expression would fail.
+metrics_file_name = "block12_metrics_" + BALANCING_METHOD.lower() + ".csv"
+metrics_table.to_csv(TABLES_FOLDER / metrics_file_name, index=False)
+print("For comparison - always 'pass': accuracy", round(float((y_train == 0).mean()), 4),
+      "| recall 0 | cost EUR", format(int(COST_FALSE_NEGATIVE * (y_train == 1).sum()), ","))
+
+plot_confusion_matrix(y_train, best_predictions,
+                      "Random forest + 18 Boruta sensors + " + BALANCING_METHOD + " (5-fold CV, training set)",
+                      "block12_01_confusion_matrix_" + BALANCING_METHOD.lower() + ".png")
+plot_roc_curve(y_train, best_probabilities, best_predictions,
+               "ROC curve: random forest + 18 sensors + " + BALANCING_METHOD + " (5-fold CV, training set)",
+               "block12_02_roc_curve_" + BALANCING_METHOD.lower() + ".png")
+
+
+# ----- 12.2 The precision-recall trade-off (illustration only, no threshold chosen) -----
+print("\n--- 12.2 Precision-recall trade-off at other thresholds (illustration; D16 is decided in Phase 3) ---")
+# A wafer is called "fail" when its failure probability is above the threshold.
+# At 0.5 this is exactly what predict() does (more than half of the trees vote fail).
+threshold_rows = []
+for threshold in [0.5, 0.4, 0.3, 0.2]:
+    threshold_predictions = (best_probabilities > threshold).astype(int)
+    row = evaluate_predictions(y_train, threshold_predictions)
+    row["threshold"] = threshold
+    threshold_rows.append(row)
+threshold_table = pd.DataFrame(threshold_rows)
+threshold_table = threshold_table[["threshold", "TP", "FN", "FP", "recall", "precision", "cost_eur"]]
+print(threshold_table.to_string(index=False))
+threshold_table.to_csv(TABLES_FOLDER / "block12_threshold_illustration.csv", index=False)
+
+
+# ----- 12.3 Normality check (manual week 5, step 1) -----
+print("\n--- 12.3 Normality check ---")
+# A Box-Cox or Yeo-Johnson transformation is only needed if the model assumes
+# normally distributed inputs. A random forest does not (it only compares values
+# with thresholds), so no transformation is applied. For the record, the
+# skewness of the 18 selected sensors (0 = symmetric like a bell curve; skewness
+# does not change with min-max scaling):
+selected_skewness = X_train_selected.skew().round(3)
+selected_skewness.to_csv(TABLES_FOLDER / "block12_selected_sensor_skewness.csv", header=["skewness"],
+                         index_label="sensor")
+print("Selected sensors with |skewness| > 1 (clearly not bell-shaped):",
+      int((selected_skewness.abs() > 1).sum()), "of", len(selected_skewness))
+print("Skewness range:", selected_skewness.min(), "to", selected_skewness.max())
+print("Conclusion: random forest does not assume normality -> no Box-Cox / Yeo-Johnson.")
+
+
+# %% Block 13: Process map and the leak-proof pipeline (training set only)
+# Phase 2 fitted the scaler and the imputer once on the whole training set and
+# then cross-validated. Here every step that learns from data (scaling, kNN
+# imputation, balancing, model) is put into one imbalanced-learn Pipeline, so
+# each cross-validation fold refits all of them on its own training part only
+# (manual Section 10). The rules decided once in Phase 1 (140 removed columns,
+# 3 sigma bounds) are applied before the pipeline (manual 10.2), and the 18
+# Boruta sensors stay a fixed list (decision of 20 Oct; one in-fold Boruta check
+# follows in Block 15). The test set is not used in this block.
+
+
+def select_sensor_columns(data, positions):
+    """
+    Keep only the columns at the given positions (the 18 Boruta sensors).
+    Used inside the pipeline, after scaling and imputation, which pass on
+    plain arrays without column names.
+
+    Input:  data (2-D array), positions (list of column positions to keep)
+    Output: 2-D array with only those columns
+    """
+    return data[:, positions]
+
+
+def make_sampler(option):
+    """
+    The balancing step for the pipeline. "none" and "class_weight" add no
+    wafers, so the step is skipped ("passthrough"); class weights are set on
+    the model instead.
+
+    Input:  option (str: "none", "class_weight", "SMOTE", "ROSE" or "ADASYN")
+    Output: an imbalanced-learn sampler, or "passthrough"
+    """
+    if option == "none" or option == "class_weight":
+        return "passthrough"
+    if option == "SMOTE":
+        return SMOTE(random_state=SEED)
+    if option == "ROSE":
+        return RandomOverSampler(shrinkage=ROSE_SHRINKAGE, random_state=SEED)
+    if option == "ADASYN":
+        return ADASYN(random_state=SEED)
+    raise ValueError("Unknown balancing option: " + str(option))
+
+
+def build_pipeline(model, balancing, n_neighbors=KNN_NEIGHBORS):
+    """
+    Build the leak-proof pipeline: min-max scaling -> kNN imputation ->
+    the 18 Boruta sensors -> balancing -> model. Every step is refitted
+    whenever the pipeline is fitted, so in cross-validation each fold learns
+    only from its own training part.
+
+    Input:  model (an unfitted classifier), balancing (str, see make_sampler),
+            n_neighbors (int, k for the kNN imputer; default KNN_NEIGHBORS)
+    Output: an imbalanced-learn Pipeline (not yet fitted)
+    """
+    # imbalanced-learn's Pipeline (not scikit-learn's) is needed because the
+    # balancer ADDS rows; it also skips the balancer at prediction time, so the
+    # wafers being evaluated are never balanced.
+    return Pipeline([
+        ("scaler", MinMaxScaler()),
+        ("imputer", KNNImputer(n_neighbors=n_neighbors)),
+        ("selector", FunctionTransformer(select_sensor_columns, kw_args={"positions": selected_positions})),
+        ("balancer", make_sampler(balancing)),
+        ("model", model),
+    ])
+
+
+def cross_validate_pipeline(pipeline, X_data, y_data):
+    """
+    Cross-validate a pipeline with the same parts as in Phase 2 (cv_splitter):
+    for each part, a fresh copy of the pipeline (clone) is fitted on the other
+    parts and predicts this one.
+
+    Input:  pipeline (unfitted Pipeline), X_data (DataFrame), y_data (Series)
+    Output: fold_costs (array: cost per part), cv_probabilities (Series:
+            out-of-fold failure probability per wafer)
+    """
+    cv_probabilities = pd.Series(0.0, index=y_data.index)
+    fold_costs = []
+    for train_positions, validation_positions in cv_splitter.split(X_data, y_data):
+        # clone() copies the settings without anything learned, so no fold
+        # reuses what another fold learned.
+        fold_pipeline = clone(pipeline)
+        fold_pipeline.fit(X_data.iloc[train_positions], y_data.iloc[train_positions])
+        fold_probabilities = fold_pipeline.predict_proba(X_data.iloc[validation_positions])[:, 1]
+        cv_probabilities.iloc[validation_positions] = fold_probabilities
+        # Cost of this part at the default rule (fail if probability above 0.5).
+        fold_predictions = (fold_probabilities > 0.5).astype(int)
+        fold_result = evaluate_predictions(y_data.iloc[validation_positions], fold_predictions)
+        fold_costs.append(fold_result["cost_eur"])
+    return np.array(fold_costs), cv_probabilities
+
+
+# The input to every pipeline: the training set after the rules applied once
+# (450 columns, capped, gaps still present). The 18 sensors are found by name.
+X_pipeline_input = X_train_treated
+selected_positions = []
+for sensor in selected_features:
+    selected_positions.append(list(X_pipeline_input.columns).index(sensor))
+
+
+# ----- 13.1 Process map (manual week 5, step 6) -----
+# Boxes in three colours: grey = exploratory only; orange = learned once on the
+# training set, applied unchanged to the test set; green = refitted inside every
+# cross-validation fold (the pipeline); blue = the locked test-set path.
+map_colors = {"explore": "#d9d9d9", "once": "#fbd6c2", "pipeline": "#cfe8d3", "test": "#cfe0f5"}
+map_boxes = [
+    (5.0, 9.4, "Download from UCI (Block 2): names, labels 0/1, time stamps", "once"),
+    (1.6, 8.3, "Block 3: descriptive analysis\n(full data, exploratory only)", "explore"),
+    (5.0, 8.3, "Block 4: stratified 80/20 split (seed 42)", "once"),
+    (3.0, 7.1, "Training set: 1,253 wafers (83 failed)", "once"),
+    (7.6, 7.1, "Test set: 314 wafers (21 failed) - LOCKED", "test"),
+    (3.0, 6.0, "Block 5: remove 140 columns\n(rule learned on training)", "once"),
+    (7.6, 6.0, "Remove the same 140 columns", "test"),
+    (3.0, 4.9, "Block 7: cap at training 3-sigma bounds", "once"),
+    (7.6, 4.9, "Cap with the training bounds", "test"),
+    (3.0, 3.55, "PIPELINE, refitted in every CV fold:\nmin-max scaling -> kNN imputation (k = 5)\n"
+                "-> 18 Boruta sensors -> balancing (training part only) -> model", "pipeline"),
+    (7.6, 3.55, "Fitted pipeline: transform only\n(no fitting, no balancing)", "test"),
+    (3.0, 2.2, "Blocks 14-16: model comparison, grid search,\nthreshold by cost (cross-validation)", "pipeline"),
+    (7.6, 2.2, "Block 17: predict with the chosen\nthreshold - FINAL TEST, ONCE", "test"),
+]
+figure, axis = plt.subplots(figsize=(12, 8))
+axis.set_xlim(0, 10)
+axis.set_ylim(1.4, 10)
+axis.axis("off")
+for x_position, y_position, text, group in map_boxes:
+    axis.text(x_position, y_position, text, ha="center", va="center", fontsize=9,
+              bbox={"boxstyle": "round,pad=0.5", "facecolor": map_colors[group], "edgecolor": "#7f7f7f"})
+# Arrows (start -> end) along the training path, the test path and the split.
+map_arrows = [((5.0, 9.15), (5.0, 8.55)), ((4.4, 9.15), (1.6, 8.65)),
+              ((5.0, 8.05), (3.0, 7.35)), ((5.0, 8.05), (7.6, 7.35)),
+              ((3.0, 6.85), (3.0, 6.3)), ((3.0, 5.7), (3.0, 5.15)), ((3.0, 4.65), (3.0, 4.05)),
+              ((3.0, 3.05), (3.0, 2.55)), ((7.6, 6.85), (7.6, 6.25)), ((7.6, 5.75), (7.6, 5.15)),
+              ((7.6, 4.65), (7.6, 3.9)), ((7.6, 3.2), (7.6, 2.55)), ((5.35, 3.55), (6.3, 3.55))]
+for start, end in map_arrows:
+    axis.annotate("", xy=end, xytext=start, arrowprops={"arrowstyle": "->", "color": "#595959"})
+legend_handles = [Patch(color=map_colors["explore"], label="exploratory only (full data)"),
+                  Patch(color=map_colors["once"], label="learned once on the training set"),
+                  Patch(color=map_colors["pipeline"], label="refitted inside every CV fold"),
+                  Patch(color=map_colors["test"], label="test set: only applies stored rules")]
+axis.legend(handles=legend_handles, loc="lower center", ncol=4, frameon=False, fontsize=9)
+axis.set_title("Process map: what is learned where (training set) and only applied (test set)")
+save_figure(figure, "block13_01_process_map.png")
+
+
+# ----- 13.2 The pipeline with the Phase 2 working choice, cross-validated -----
+print("\n--- 13.2 Leak-proof pipeline: random forest + 18 sensors + " + BALANCING_METHOD + " (5-fold CV) ---")
+working_pipeline = build_pipeline(RandomForestClassifier(random_state=SEED), BALANCING_METHOD)
+pipeline_fold_costs, pipeline_probabilities = cross_validate_pipeline(working_pipeline, X_pipeline_input, y_train)
+pipeline_predictions = (pipeline_probabilities > 0.5).astype(int)
+
+# Phase 2 chain (scaler and imputer fitted once on the whole training set, from
+# Block 12) vs. the pipeline (refitted in every fold): the difference shows how
+# optimistic the simpler Phase 2 set-up was.
+leak_rows = []
+for name, predictions, probabilities in [
+        ("Phase 2 chain (scaler + imputer fitted once)", best_predictions, best_probabilities),
+        ("Leak-proof pipeline (refitted per fold)", pipeline_predictions, pipeline_probabilities)]:
+    row = full_evaluation(y_train, predictions, probabilities)
+    row["set_up"] = name
+    leak_rows.append(row)
+pipeline_comparison = pd.DataFrame(leak_rows)
+pipeline_comparison = pipeline_comparison[["set_up", "TN", "FP", "FN", "TP", "recall", "precision",
+                                           "F2", "ROC_AUC", "cost_eur"]]
+print(pipeline_comparison.to_string(index=False))
+pipeline_comparison.to_csv(TABLES_FOLDER / "block13_pipeline_vs_phase2.csv", index=False)
+print("Cost per fold (pipeline):", pipeline_fold_costs.tolist())
+
+
+# ----- 13.3 Pipeline checks (manual 10.5, adapted: the test set stays locked) -----
+print("\n--- 13.3 Pipeline checks ---")
+# Shape check: all steps except the model. fit_resample runs scaling,
+# imputation, sensor selection and balancing on the training set.
+check_pipeline = clone(working_pipeline)
+X_check, y_check = check_pipeline[:-1].fit_resample(X_pipeline_input, y_train)
+print("Shape just before the model:", X_check.shape, "| pass", int((y_check == 0).sum()),
+      "| fail", int((y_check == 1).sum()), "(expected 2340 x 18 with ROSE)")
+
+# Reproducibility check: a second cross-validation run must give exactly the
+# same probabilities (every random step has random_state=SEED).
+repeat_fold_costs, repeat_probabilities = cross_validate_pipeline(working_pipeline, X_pipeline_input, y_train)
+print("Second run identical:", bool(np.array_equal(pipeline_probabilities.to_numpy(), repeat_probabilities.to_numpy())))
+
+# Row counts side by side: the pipeline is only ever fitted on training wafers.
+print("Training wafers used for fitting:", len(X_pipeline_input), "| test wafers (untouched):", len(X_test))
+
+
+# %% Block 14: Model x balancing comparison (training set only)
+# Compares model families and balancing options fairly: the same leak-proof
+# pipeline, the same 18 sensors and the same five CV parts for every
+# combination (decisions D11, D13). The shortlist for the grid search follows
+# the rule fixed before this run (DECISIONS.md, 20 Oct): rank by mean average
+# precision (D15) and take the best combination of each model family until 5
+# families are chosen. Optional soft-voting check (D17). The test set is not used.
+
+
+def make_model(family, balancing):
+    """
+    Create an unfitted model of one family. With balancing "class_weight" the
+    model weights each failed wafer by about 1,170 / 83 (class_weight="balanced").
+
+    Input:  family (str), balancing (str)
+    Output: an unfitted classifier
+    """
+    class_weight = "balanced" if balancing == "class_weight" else None
+    if family == "logistic_regression":
+        # max_iter=1000 (default 100) gives the solver enough steps to finish;
+        # default C=1.0 (strength of the penalty), tuned in Block 15.
+        return LogisticRegression(max_iter=1000, class_weight=class_weight, random_state=SEED)
+    if family == "random_forest":
+        # Defaults: 100 trees, max_features="sqrt".
+        return RandomForestClassifier(class_weight=class_weight, random_state=SEED)
+    if family == "gradient_boosting":
+        # Defaults: 100 boosting rounds, learning_rate=0.1, max_leaf_nodes=31;
+        # it can handle missing values itself, but gets the imputed data here.
+        return HistGradientBoostingClassifier(class_weight=class_weight, random_state=SEED)
+    if family == "naive_bayes":
+        # Gaussian naive Bayes has no class weights and no randomness.
+        return GaussianNB()
+    if family == "balanced_random_forest":
+        # Each of its 100 trees learns from all failed wafers plus an equally
+        # large random sample of passed wafers (defaults sampling_strategy="all",
+        # replacement=True, bootstrap=False): balancing happens inside the model.
+        return BalancedRandomForestClassifier(random_state=SEED)
+    if family == "easy_ensemble":
+        # 10 AdaBoost models (default), each on all failed wafers plus a random,
+        # equally large sample of passed wafers: balancing inside the model.
+        return EasyEnsembleClassifier(random_state=SEED)
+    if family == "dummy":
+        # Always predicts the most frequent class ("pass"): the no-skill baseline.
+        return DummyClassifier(strategy="most_frequent")
+    raise ValueError("Unknown model family: " + str(family))
+
+
+def fold_values(y_data, probabilities):
+    """
+    Average precision and recall (at threshold 0.5) in each CV part, from the
+    out-of-fold probabilities (cv_splitter always gives the same parts).
+
+    Input:  y_data (Series of labels), probabilities (Series, out-of-fold)
+    Output: two arrays: average precision per part, recall per part
+    """
+    precision_values = []
+    recall_values = []
+    for train_positions, validation_positions in cv_splitter.split(y_data, y_data):
+        y_part = y_data.iloc[validation_positions]
+        probabilities_part = probabilities.iloc[validation_positions]
+        precision_values.append(average_precision_score(y_part, probabilities_part))
+        recall_values.append(evaluate_predictions(y_part, (probabilities_part > 0.5).astype(int))["recall"])
+    return np.array(precision_values), np.array(recall_values)
+
+
+# ----- 14.1 The combinations -----
+# Every model family with the balancing options it can use; the two balanced
+# ensembles and the dummy balance internally or not at all ("none" only).
+combinations = []
+for family in ["logistic_regression", "random_forest", "gradient_boosting"]:
+    for balancing in options_for_phase3:
+        combinations.append((family, balancing))
+for balancing in options_for_phase3:
+    if balancing != "class_weight":
+        combinations.append(("naive_bayes", balancing))
+combinations.append(("balanced_random_forest", "none"))
+combinations.append(("easy_ensemble", "none"))
+combinations.append(("dummy", "none"))
+print("\n--- 14.1 Model x balancing matrix:", len(combinations), "combinations, 5-fold CV ---")
+
+matrix_rows = []
+matrix_fold_rows = []
+combination_probabilities = {}
+combination_average_precisions = {}
+for family, balancing in combinations:
+    pipeline = build_pipeline(make_model(family, balancing), balancing)
+    costs_per_fold, probabilities = cross_validate_pipeline(pipeline, X_pipeline_input, y_train)
+    precisions_per_fold, recalls_per_fold = fold_values(y_train, probabilities)
+    name = family + " + " + balancing
+    combination_probabilities[name] = probabilities
+    combination_average_precisions[name] = precisions_per_fold
+    totals = full_evaluation(y_train, (probabilities > 0.5).astype(int), probabilities)
+    matrix_rows.append({"combination": name, "family": family, "balancing": balancing,
+                        "mean_average_precision": round(float(precisions_per_fold.mean()), 4),
+                        "std_average_precision": round(float(precisions_per_fold.std(ddof=1)), 4),
+                        "ROC_AUC": totals["ROC_AUC"],
+                        "mean_recall_at_0.5": round(float(recalls_per_fold.mean()), 4),
+                        "TP_at_0.5": totals["TP"], "FP_at_0.5": totals["FP"],
+                        "cost_at_0.5": totals["cost_eur"],
+                        "std_cost_per_fold": round(float(costs_per_fold.std(ddof=1)), 1)})
+    for part in range(len(costs_per_fold)):
+        matrix_fold_rows.append({"combination": name, "fold": part + 1,
+                                 "average_precision": round(float(precisions_per_fold[part]), 4),
+                                 "recall_at_0.5": recalls_per_fold[part],
+                                 "cost_at_0.5": int(costs_per_fold[part])})
+    print("  " + name.ljust(40), "AP", round(float(precisions_per_fold.mean()), 3),
+          "+/-", round(float(precisions_per_fold.std(ddof=1)), 3), "| cost at 0.5", totals["cost_eur"])
+
+model_matrix = pd.DataFrame(matrix_rows).sort_values("mean_average_precision", ascending=False)
+model_matrix.to_csv(TABLES_FOLDER / "block14_model_matrix.csv", index=False)
+pd.DataFrame(matrix_fold_rows).to_csv(TABLES_FOLDER / "block14_model_matrix_folds.csv", index=False)
+
+
+# ----- 14.2 Shortlist for the grid search (rule fixed before this run) -----
+print("\n--- 14.2 Shortlist: best combination of each family by mean average precision (5 families) ---")
+shortlist_rows = []
+families_taken = []
+for row_number in range(len(model_matrix)):
+    row = model_matrix.iloc[row_number]
+    if row["family"] == "dummy" or row["family"] in families_taken:
+        continue
+    families_taken.append(row["family"])
+    shortlist_rows.append(row)
+    if len(families_taken) == 5:
+        break
+shortlist = pd.DataFrame(shortlist_rows)
+print(shortlist[["combination", "mean_average_precision", "std_average_precision", "ROC_AUC",
+                 "cost_at_0.5"]].to_string(index=False))
+shortlist.to_csv(TABLES_FOLDER / "block14_shortlist.csv", index=False)
+shortlist_pairs = []
+for row_number in range(len(shortlist)):
+    shortlist_pairs.append((shortlist.iloc[row_number]["family"], shortlist.iloc[row_number]["balancing"]))
+
+# Chart: mean average precision +/- standard deviation for every combination,
+# shortlisted pairs in green, the dummy baseline in grey, the rest in blue.
+chart_data = model_matrix.iloc[::-1]
+bar_colors = []
+for row_number in range(len(chart_data)):
+    name = chart_data.iloc[row_number]["combination"]
+    if chart_data.iloc[row_number]["family"] == "dummy":
+        bar_colors.append("#a6a6a6")
+    elif name in list(shortlist["combination"]):
+        bar_colors.append("#008300")
+    else:
+        bar_colors.append(COLOR_MAIN)
+figure, axis = plt.subplots(figsize=(9, 9))
+axis.barh(chart_data["combination"], chart_data["mean_average_precision"],
+          xerr=chart_data["std_average_precision"], color=bar_colors, capsize=3)
+axis.axvline(float(y_train.mean()), linestyle="--", color=COLOR_REFERENCE)
+axis.text(float(y_train.mean()), -0.9, " random guess = failure share (" + str(round(float(y_train.mean()), 3)) + ")",
+          color=COLOR_REFERENCE, fontsize=8, va="top")
+legend_handles = [Patch(color="#008300", label="shortlisted (best of 5 families)"),
+                  Patch(color=COLOR_MAIN, label="other combinations"),
+                  Patch(color="#a6a6a6", label="dummy baseline")]
+axis.legend(handles=legend_handles, loc="lower right", fontsize=8)
+axis.set_xlabel("Average precision, mean over 5 folds (bars: +/- one standard deviation)")
+axis.set_title("Model x balancing comparison (training set, leak-proof pipeline, 18 sensors)")
+axis.spines["top"].set_visible(False)
+axis.spines["right"].set_visible(False)
+save_figure(figure, "block14_01_model_comparison.png")
+
+
+# ----- 14.3 Optional soft-voting ensemble of the 3 best shortlisted pairs (D17) -----
+print("\n--- 14.3 Soft-voting check (D17) ---")
+# VotingClassifier with voting="soft" averages the failure probabilities of its
+# members. Each member is a complete pipeline with its own balancing, so every
+# member is still refitted inside each fold.
+voting_members = []
+for family, balancing in shortlist_pairs[:3]:
+    voting_members.append((family, build_pipeline(make_model(family, balancing), balancing)))
+voting_ensemble = VotingClassifier(estimators=voting_members, voting="soft")
+voting_costs, voting_probabilities = cross_validate_pipeline(voting_ensemble, X_pipeline_input, y_train)
+voting_precisions, voting_recalls = fold_values(y_train, voting_probabilities)
+
+best_single = shortlist.iloc[0]["combination"]
+differences = voting_precisions - combination_average_precisions[best_single]
+keep_voting = float(differences.mean()) > float(differences.std(ddof=1))
+voting_check = pd.DataFrame([{"ensemble": "soft vote of " + " | ".join(shortlist["combination"][:3]),
+                              "mean_average_precision": round(float(voting_precisions.mean()), 4),
+                              "best_single": best_single,
+                              "best_single_average_precision": round(float(combination_average_precisions[best_single].mean()), 4),
+                              "mean_difference": round(float(differences.mean()), 4),
+                              "std_of_differences": round(float(differences.std(ddof=1)), 4),
+                              "kept": keep_voting}])
+print(voting_check.T.to_string(header=False))
+voting_check.to_csv(TABLES_FOLDER / "block14_voting_check.csv", index=False)
+print("Soft-voting ensemble kept (D17):", keep_voting)
