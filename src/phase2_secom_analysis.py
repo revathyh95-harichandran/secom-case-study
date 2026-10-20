@@ -116,9 +116,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 # The script only saves figures to files and never opens a window, so matplotlib
-# uses the file-only "Agg" backend. The default window backend (Tk) prints
-# "main thread is not in main loop" errors when Boruta's forest (n_jobs=-1)
-# runs in several threads. use() must come before pyplot is imported.
+# uses the file-only "Agg" backend. The default window backend (Tk) printed
+# "main thread is not in main loop" errors when a multi-threaded step ran
+# (DEBUG_LOG.md, 20 Oct). use() must come before pyplot is imported.
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -133,6 +133,9 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import confusion_matrix
 # Phase 2 import: Boruta feature selection (Block 10).
 from boruta import BorutaPy
+# Phase 2 imports: balancing (Block 11).
+from imblearn.over_sampling import SMOTE, ADASYN, RandomOverSampler
+from sklearn.neighbors import NearestNeighbors
 
 
 # %% Block 1: Settings
@@ -186,6 +189,14 @@ CV_FOLDS = 5
 # ("including tentative ones").
 BORUTA_MAX_ITER = 100
 KEEP_TENTATIVE = True
+
+# Phase 2 settings - balancing (decision D11). BALANCING_METHOD is the working
+# choice for Phase 2 after the screening in Block 11 ("none", "class_weight",
+# "SMOTE", "ROSE" or "ADASYN"): ROSE had the lowest cross-validated cost.
+# ROSE_SHRINKAGE = 1.0 reproduces ROSE's default amount of smoothing (the noise
+# added around each copied failed wafer); 0 would mean plain copies.
+BALANCING_METHOD = "ROSE"
+ROSE_SHRINKAGE = 1.0
 
 # Download links of the two original files in the UCI repository (dataset 179).
 URL_SENSOR_DATA = "https://archive.ics.uci.edu/ml/machine-learning-databases/secom/secom.data"
@@ -1356,14 +1367,60 @@ print("\n--- 9.2 Random forest, " + str(CV_FOLDS) + "-fold stratified cross-vali
 cv_splitter = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=SEED)
 
 
-def cross_validate_random_forest(X_data, y_data):
+def balance_training_data(option, X_data, y_data):
+    """
+    Balance training data with one of the options screened in Block 11.
+    Only ever called on training data (inside a training fold or on the
+    training set), never on data that is evaluated.
+
+    Input:  option (str: "none", "class_weight", "SMOTE", "ROSE" or "ADASYN"),
+            X_data (DataFrame of training features), y_data (Series of training labels)
+    Output: X_balanced (DataFrame), y_balanced (Series), class_weight (None or
+            "balanced", the setting for the random forest)
+    """
+    # "none" and "class_weight" create no new wafers; class weights are handled by the model.
+    if option == "none":
+        return X_data, y_data, None
+    if option == "class_weight":
+        return X_data, y_data, "balanced"
+    # sampling_strategy="auto" (default) adds failed wafers until both classes
+    # are equally large; random_state=SEED makes the new wafers repeatable.
+    if option == "SMOTE":
+        # k_neighbors=5 (default): a new wafer lies between a failed wafer and
+        # one of its 5 nearest failed neighbours.
+        sampler = SMOTE(random_state=SEED)
+    elif option == "ROSE":
+        # A smoothed bootstrap: copy a random failed wafer and add a little
+        # random noise; shrinkage sets how much (1.0 = ROSE's default rule).
+        sampler = RandomOverSampler(shrinkage=ROSE_SHRINKAGE, random_state=SEED)
+    elif option == "ADASYN":
+        # n_neighbors=5 (default): like SMOTE, but more new wafers where failed
+        # wafers are surrounded by passed ones.
+        sampler = ADASYN(random_state=SEED)
+    else:
+        raise ValueError("Unknown balancing option: " + str(option))
+    X_balanced, y_balanced = sampler.fit_resample(X_data, y_data)
+    # The original wafers come first, the new ones are appended; the original
+    # wafer numbers are kept and the new rows are named synthetic_1, synthetic_2, ...
+    new_index = list(X_data.index)
+    for number in range(1, len(X_balanced) - len(X_data) + 1):
+        new_index.append("synthetic_" + str(number))
+    X_balanced.index = new_index
+    y_balanced = pd.Series(np.asarray(y_balanced), index=new_index, name=y_data.name)
+    return X_balanced, y_balanced, None
+
+
+def cross_validate_random_forest(X_data, y_data, balancing="none"):
     """
     Evaluate a random forest (seed SEED, default settings) with the stratified
     cross-validation parts of cv_splitter: for each part, a new forest learns
     from the other parts and predicts this one, so every wafer is predicted
-    exactly once by a model that never saw it.
+    exactly once by a model that never saw it. If a balancing option is given,
+    only the training part of each fold is balanced; the part that is
+    evaluated keeps its real class mix.
 
-    Input:  X_data (DataFrame of training features), y_data (Series of training labels)
+    Input:  X_data (DataFrame of training features), y_data (Series of training labels),
+            balancing (str, default "none": see balance_training_data)
     Output: fold_table (DataFrame: one row of results per part),
             cv_predictions (Series: out-of-fold predicted class per wafer),
             cv_probabilities (Series: out-of-fold predicted failure probability per wafer)
@@ -1380,9 +1437,12 @@ def cross_validate_random_forest(X_data, y_data):
         X_fold_validation = X_data.iloc[validation_positions]
         y_fold_validation = y_data.iloc[validation_positions]
 
+        # Balance the training part only (rule 8); the validation part is left as it is.
+        X_fold_balanced, y_fold_balanced, class_weight = balance_training_data(balancing, X_fold_train, y_fold_train)
+
         # A new forest with the same settings for every part, trained without the validation part.
-        fold_model = RandomForestClassifier(random_state=SEED)
-        fold_model.fit(X_fold_train, y_fold_train)
+        fold_model = RandomForestClassifier(random_state=SEED, class_weight=class_weight)
+        fold_model.fit(X_fold_balanced, y_fold_balanced)
         fold_predictions = fold_model.predict(X_fold_validation)
         # predict_proba() gives [P(pass), P(fail)] per wafer; column 1 is the share of trees voting fail.
         fold_probabilities = fold_model.predict_proba(X_fold_validation)[:, 1]
@@ -1466,10 +1526,11 @@ print("\n--- 10.1 Boruta feature selection (training set) ---")
 # The forest inside Boruta: class_weight="balanced" weights each failed wafer by
 # about 1,170 / 83 so the few failures count as much as the many passes;
 # max_depth=5 keeps the trees shallow, as the Boruta documentation recommends,
-# which gives steadier importances; n_jobs=-1 uses all processor cores (faster,
-# same result); random_state=SEED makes it repeatable.
+# which gives steadier importances; n_jobs=None (default) runs on one processor
+# thread: about 25 s slower than all cores, but the same result and no
+# multi-threading warnings (DEBUG_LOG.md, 20 Oct); random_state=SEED makes it repeatable.
 boruta_forest = RandomForestClassifier(class_weight="balanced", max_depth=5,
-                                       n_jobs=-1, random_state=SEED)
+                                       n_jobs=None, random_state=SEED)
 # n_estimators="auto" lets Boruta choose the number of trees from the number of
 # columns. Defaults kept: perc=100 (a sensor must beat the BEST shadow), alpha=0.05
 # (significance level), two_step=True (test corrected for testing 450 sensors).
@@ -1558,8 +1619,175 @@ selection_comparison.to_csv(TABLES_FOLDER / "block10_cv_comparison.csv", index=F
 X_train_selected = X_train_imputed[selected_features]
 save_processed(X_train_selected, y_train, "block10_train_selected.csv")
 
-# %% Block 11: Balancing
-# Balance the training set with SMOTE or ROSE; the test set is never balanced (Phase 2).
+# %% Block 11: Class imbalance - screening five balancing options (training set only)
+# With 1,170 passed and 83 failed training wafers, a model can be right 93 % of
+# the time by ignoring failures. Balancing changes what the model learns from
+# (manual Section 9). Five options are screened on the random forest with the
+# 18 Boruta sensors and the same five CV parts, balancing only the training
+# part of each fold (rule 8). ADASYN may be dropped only by the drop rule fixed
+# in advance (DECISIONS.md, 20 Oct); the working choice is decision D11.
+# The test set is never balanced and is not used here.
+
+# ----- 11.1 Class counts before and after balancing (whole training set, for the chart) -----
+print("\n--- 11.1 Class counts before and after balancing (training set) ---")
+count_rows = [{"version": "original", "pass": int((y_train == 0).sum()), "fail": int((y_train == 1).sum())}]
+for option in ["SMOTE", "ROSE", "ADASYN"]:
+    X_balanced, y_balanced, unused_weight = balance_training_data(option, X_train_selected, y_train)
+    count_rows.append({"version": option, "pass": int((y_balanced == 0).sum()), "fail": int((y_balanced == 1).sum())})
+class_counts_table = pd.DataFrame(count_rows)
+print(class_counts_table.to_string(index=False))
+print("class_weight: no new wafers; each failed wafer counts about",
+      round((y_train == 0).sum() / (y_train == 1).sum(), 1), "times as much in training")
+
+# Grouped bars: pass and fail count per version, each bar labelled with its number.
+figure, axis = plt.subplots(figsize=(8, 4.5))
+positions = np.arange(len(class_counts_table))
+bar_width = 0.38
+axis.bar(positions - bar_width / 2, class_counts_table["pass"], bar_width, color=COLOR_PASS, label="Pass (0)")
+axis.bar(positions + bar_width / 2, class_counts_table["fail"], bar_width, color=COLOR_FAIL, label="Fail (1)")
+for position in positions:
+    axis.text(position - bar_width / 2, class_counts_table["pass"][position],
+              str(class_counts_table["pass"][position]), ha="center", va="bottom", fontsize=9)
+    axis.text(position + bar_width / 2, class_counts_table["fail"][position],
+              str(class_counts_table["fail"][position]), ha="center", va="bottom", fontsize=9)
+axis.set_xticks(positions)
+axis.set_xticklabels(["Original", "SMOTE", "ROSE", "ADASYN"])
+axis.set_ylabel("Training wafers")
+axis.set_title("Class counts before and after balancing (training set only; test set never balanced)")
+axis.legend()
+axis.spines["top"].set_visible(False)
+axis.spines["right"].set_visible(False)
+save_figure(figure, "block11_01_class_counts.png")
+
+
+# ----- 11.2 Screening: five options, same folds, balancing inside each training fold -----
+print("\n--- 11.2 Screening five balancing options (random forest, 18 sensors, 5-fold CV) ---")
+balancing_options = ["none", "class_weight", "SMOTE", "ROSE", "ADASYN"]
+fold_costs = {}
+fold_rows_all = []
+total_rows = []
+for option in balancing_options:
+    folds, predictions, probabilities = cross_validate_random_forest(X_train_selected, y_train, option)
+    fold_costs[option] = folds["cost_eur"].to_numpy()
+    for row_number in range(len(folds)):
+        fold_rows_all.append({"option": option, "fold": int(folds["fold"][row_number]),
+                              "cost_eur": int(folds["cost_eur"][row_number]),
+                              "recall": folds["recall"][row_number],
+                              "TP": int(folds["TP"][row_number]), "FP": int(folds["FP"][row_number])})
+    total_row = evaluate_predictions(y_train, predictions)
+    total_row["option"] = option
+    total_row["mean_cost_per_fold"] = round(float(folds["cost_eur"].mean()), 1)
+    total_row["std_cost_per_fold"] = round(float(folds["cost_eur"].std()), 1)
+    total_rows.append(total_row)
+
+balancing_folds_table = pd.DataFrame(fold_rows_all)
+balancing_folds_table.to_csv(TABLES_FOLDER / "block11_balancing_folds.csv", index=False)
+balancing_comparison = pd.DataFrame(total_rows)
+balancing_comparison = balancing_comparison[["option", "TN", "FP", "FN", "TP", "recall", "precision",
+                                             "specificity", "F1", "cost_eur",
+                                             "mean_cost_per_fold", "std_cost_per_fold"]]
+print(balancing_comparison.to_string(index=False))
+balancing_comparison.to_csv(TABLES_FOLDER / "block11_balancing_comparison.csv", index=False)
+print("Cost per fold (EUR):")
+for option in balancing_options:
+    # tolist() turns the numpy array into plain Python numbers for printing.
+    print("  " + option.ljust(13), fold_costs[option].tolist())
+
+# Line chart: cost of every option in every fold, so stability is visible.
+option_colors = {"none": "#a6a6a6", "class_weight": "#2a78d6", "SMOTE": "#eb6834",
+                 "ROSE": "#1baf7a", "ADASYN": "#6250d6"}
+fold_numbers = np.arange(1, CV_FOLDS + 1)
+figure, axis = plt.subplots(figsize=(8, 4.5))
+for option in balancing_options:
+    axis.plot(fold_numbers, fold_costs[option] / 1000, marker="o", linewidth=2,
+              color=option_colors[option], label=option)
+axis.set_xticks(fold_numbers)
+axis.set_xlabel("Cross-validation fold")
+axis.set_ylabel("Cost in the fold (thousand EUR)")
+axis.set_title("Balancing options: cost per fold (random forest, 18 sensors, training set)")
+axis.legend(ncol=5, loc="upper center", bbox_to_anchor=(0.5, -0.15), frameon=False)
+axis.spines["top"].set_visible(False)
+axis.spines["right"].set_visible(False)
+save_figure(figure, "block11_02_cost_per_fold.png")
+
+
+# ----- 11.3 Drop rule for ADASYN (fixed in advance) -----
+print("\n--- 11.3 ADASYN drop rule ---")
+# The best option is the one with the lowest total cross-validated cost.
+total_costs = balancing_comparison.set_index("option")["cost_eur"]
+best_option = total_costs.idxmin()
+print("Best option (lowest total cost):", best_option)
+
+# A neighbour search over the real training wafers (18 sensors), used without
+# any model to see where failed wafers lie. Default distance: Euclidean.
+neighbour_finder = NearestNeighbors(n_neighbors=5)
+neighbour_finder.fit(X_train_selected)
+
+# For context: for each real failed wafer, the share of passed wafers among its
+# 5 nearest other wafers (6 neighbours are asked for, because the nearest one
+# is the wafer itself at distance 0 and is skipped).
+distances, neighbour_positions = neighbour_finder.kneighbors(X_train_selected[y_train == 1], n_neighbors=6)
+real_pass_neighbours = (y_train.to_numpy()[neighbour_positions[:, 1:]] == 0).mean()
+print("Real failed wafers: average share of passed wafers among their 5 nearest neighbours:",
+      round(float(real_pass_neighbours), 3))
+
+if best_option == "ADASYN":
+    condition_1 = False
+    condition_2 = False
+    condition_3 = False
+    print("ADASYN is itself the best option, so it cannot be dropped.")
+else:
+    # Fold-by-fold cost differences ADASYN minus best option (positive = ADASYN worse).
+    differences = fold_costs["ADASYN"] - fold_costs[best_option]
+    worse_folds = int((differences > 0).sum())
+    mean_difference = float(differences.mean())
+    std_difference = float(differences.std(ddof=1))
+    # Condition 1: worse in at least 4 of the 5 folds.
+    condition_1 = worse_folds >= 4
+    # Condition 2: worse on average by more than the fold-to-fold noise
+    # (sample standard deviation of the differences, ddof=1).
+    condition_2 = mean_difference > std_difference
+    print("Condition 1 - worse in at least 4 of 5 folds:", condition_1, "(worse in", worse_folds, "folds)")
+    print("Condition 2 - mean difference > std of differences:", condition_2,
+          "(mean", round(mean_difference), "EUR, std", round(std_difference), "EUR)")
+
+    # Condition 3, measured without any model: where do the synthetic failed
+    # wafers land? For each synthetic wafer, count how many of its 5 nearest
+    # real training wafers are passed wafers. If ADASYN puts more synthetic
+    # failures deep inside passed regions (4 or 5 of 5 neighbours passed) than
+    # SMOTE does, the reason would come from the data and apply to every model.
+    deep_in_pass_share = {}
+    for option in ["SMOTE", "ADASYN"]:
+        X_balanced, y_balanced, unused_weight = balance_training_data(option, X_train_selected, y_train)
+        synthetic_rows = X_balanced.iloc[len(X_train_selected):]
+        distances, neighbour_positions = neighbour_finder.kneighbors(synthetic_rows)
+        pass_neighbour_counts = (y_train.to_numpy()[neighbour_positions] == 0).sum(axis=1)
+        deep_in_pass_share[option] = float((pass_neighbour_counts >= 4).mean())
+        print("  " + option + ": share of synthetic failed wafers with >= 4 of 5 passed neighbours:",
+              round(deep_in_pass_share[option], 3))
+    condition_3 = deep_in_pass_share["ADASYN"] > deep_in_pass_share["SMOTE"]
+    print("Condition 3 - data-based reason (ADASYN deeper in passed regions than SMOTE):", condition_3)
+
+drop_adasyn = condition_1 and condition_2 and condition_3
+options_for_phase3 = list(balancing_options)
+if drop_adasyn:
+    options_for_phase3.remove("ADASYN")
+print("ADASYN dropped:", drop_adasyn, "| options continuing to Phase 3:", options_for_phase3)
+
+
+# ----- 11.4 Working choice for Phase 2 (decision D11) -----
+print("\n--- 11.4 Working choice (D11) ---")
+print("Setting BALANCING_METHOD:", BALANCING_METHOD, "| screening winner:", best_option)
+if BALANCING_METHOD != best_option:
+    print("Note: the setting differs from the screening winner; check decision D11.")
+
+# Processed data: the whole training set balanced with the working choice
+# (original wafers keep their wafer_id; new wafers are named synthetic_...).
+X_train_balanced, y_train_balanced, working_class_weight = balance_training_data(
+    BALANCING_METHOD, X_train_selected, y_train)
+print("Training set after", BALANCING_METHOD + ":", int((y_train_balanced == 0).sum()), "pass /",
+      int((y_train_balanced == 1).sum()), "fail")
+save_processed(X_train_balanced, y_train_balanced, "block11_train_balanced_" + BALANCING_METHOD.lower() + ".csv")
 
 # %% Block 12: Evaluation helpers
 # Functions for the confusion matrix, metrics, ROC curve and total cost (Phase 2).
