@@ -1,0 +1,2 @@
+scaling,imputation,training_wafers,columns,missing_before,missing_after
+"min-max (0 to 1), fitted on training set","KNNImputer, k = 5, uniform weights, nan_euclidean",1253,450,11211,0

@@ -117,6 +117,9 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
+# Phase 2 imports: scaling and kNN imputation (Block 8).
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.impute import KNNImputer
 
 
 # %% Block 1: Settings
@@ -152,6 +155,11 @@ CORRELATION_LIMIT = 0.8
 # extreme values back to the bound. All three stay available for the grid search.
 OUTLIER_SIGMA = 3
 OUTLIER_TREATMENT = "cap"
+
+# Phase 2 setting - kNN imputation (decision D9): a gap is filled with the
+# average of the KNN_NEIGHBORS most similar training wafers. 5 is the manual's
+# required starting point; it stays a setting so the grid search can try 3 to 9.
+KNN_NEIGHBORS = 5
 
 # Download links of the two original files in the UCI repository (dataset 179).
 URL_SENSOR_DATA = "https://archive.ics.uci.edu/ml/machine-learning-databases/secom/secom.data"
@@ -1178,7 +1186,91 @@ print("Columns with at least one missing value:", (missing_percent_before > 0).s
 print("Ten columns with the most missing values (%):")
 print(missing_percent_before.sort_values(ascending=False).head(10).round(2))
 
-# ----- 8.2 Scaling and kNN imputation (Step 2.2, to follow) -----
+# ----- 8.2 Min-max scaling (decision D8, fitted on the training set only) -----
+print("\n--- 8.2 Min-max scaling (training set) ---")
+# kNN imputation measures distances across all sensors, so every sensor must be
+# on the same scale; otherwise sensors measured in thousands would decide alone
+# which wafers count as neighbours. MinMaxScaler maps each column to 0 to 1
+# (default feature_range=(0, 1)): (value - minimum) / (maximum - minimum).
+# fit() learns each column's minimum and maximum from the training set only;
+# missing values are ignored when learning and stay missing after transform().
+scaler = MinMaxScaler()
+scaler.fit(X_train_treated)
+X_train_scaled = pd.DataFrame(scaler.transform(X_train_treated),
+                              columns=X_train_treated.columns, index=X_train_treated.index)
+print("Scaled training values from", round(X_train_scaled.min().min(), 4), "to",
+      round(X_train_scaled.max().max(), 4), "| missing values still:", X_train_scaled.isna().sum().sum())
+
+
+# ----- 8.3 kNN imputation (decision D9, fitted on the training set only) -----
+print("\n--- 8.3 kNN imputation (training set) ---")
+# For each gap, KNNImputer finds the KNN_NEIGHBORS most similar training wafers
+# and fills the gap with their average value for that sensor. Defaults used:
+# weights="uniform" (all neighbours count equally) and metric="nan_euclidean"
+# (the distance between two wafers uses only the sensors both have measured).
+# fit() stores the scaled training wafers as the pool of possible neighbours.
+imputer = KNNImputer(n_neighbors=KNN_NEIGHBORS)
+imputer.fit(X_train_scaled)
+X_train_imputed = pd.DataFrame(imputer.transform(X_train_scaled),
+                               columns=X_train_scaled.columns, index=X_train_scaled.index)
+
+# Checks: no gap may remain, and every value that was measured must be unchanged
+# (only the gaps are filled). 1e-9 allows for tiny rounding differences.
+missing_after_imputation = X_train_imputed.isna().sum().sum()
+measured = X_train_scaled.notna()
+largest_change = (X_train_imputed[measured] - X_train_scaled[measured]).abs().max().max()
+print("Missing values: before", missing_before_imputation, "| after", missing_after_imputation)
+print("Largest change to a measured value:", largest_change)
+if missing_after_imputation != 0 or largest_change > 1e-9:
+    raise ValueError("Imputation check failed: gaps remain or measured values changed.")
+
+# The fitted scaler and imputer are the stored rules for the final evaluation
+# (Phase 3, Block 17): the test set will only get scaler.transform() and then
+# imputer.transform(); nothing is ever fitted on it. The test set is not used here.
+
+# Summary table and processed data (scaled 0 to 1, no gaps).
+imputation_summary = pd.DataFrame([{"scaling": "min-max (0 to 1), fitted on training set",
+                                    "imputation": "KNNImputer, k = " + str(KNN_NEIGHBORS) + ", uniform weights, nan_euclidean",
+                                    "training_wafers": X_train_imputed.shape[0],
+                                    "columns": X_train_imputed.shape[1],
+                                    "missing_before": missing_before_imputation,
+                                    "missing_after": missing_after_imputation}])
+imputation_summary.to_csv(TABLES_FOLDER / "block8_imputation_summary.csv", index=False)
+save_processed(X_train_imputed, y_train, "block8_train_imputed.csv")
+
+
+# ----- 8.4 Before/after histogram for the most incomplete sensor -----
+# The sensor with the most gaps shows the effect of imputation most clearly. The
+# imputed values are turned back into the sensor's original units with
+# inverse_transform(), only for this picture, so the axis is readable.
+example_sensor = missing_percent_before.idxmax()
+values_observed = X_train_treated[example_sensor].dropna()
+X_train_imputed_original_units = pd.DataFrame(scaler.inverse_transform(X_train_imputed),
+                                              columns=X_train_imputed.columns,
+                                              index=X_train_imputed.index)
+values_after = X_train_imputed_original_units[example_sensor]
+print("\n" + example_sensor + ":", round(missing_percent_before[example_sensor], 2), "% missing")
+print("  observed only:       n =", len(values_observed), "| mean", round(values_observed.mean(), 3),
+      "| std", round(values_observed.std(), 3))
+print("  observed + imputed:  n =", len(values_after), "| mean", round(values_after.mean(), 3),
+      "| std", round(values_after.std(), 3))
+
+# Same bins in both panels (np.linspace: 31 edges = 30 equal bins over the
+# observed range), so the two histograms can be compared directly.
+bin_edges = np.linspace(values_after.min(), values_after.max(), 31)
+figure, (axis_left, axis_right) = plt.subplots(1, 2, figsize=(10, 4), sharey=True)
+axis_left.hist(values_observed, bins=bin_edges, color=COLOR_MAIN, edgecolor="white")
+axis_left.set_title("Before: observed only (n = " + str(len(values_observed)) + ")")
+axis_right.hist(values_after, bins=bin_edges, color=COLOR_MAIN, edgecolor="white")
+axis_right.set_title("After: observed + imputed (n = " + str(len(values_after)) + ")")
+axis_left.set_ylabel("Number of training wafers")
+for axis in [axis_left, axis_right]:
+    axis.set_xlabel(example_sensor + " value (original units)")
+    axis.spines["top"].set_visible(False)
+    axis.spines["right"].set_visible(False)
+figure.suptitle(example_sensor + " (" + str(round(missing_percent_before[example_sensor], 1))
+                + " % missing): kNN imputation, k = " + str(KNN_NEIGHBORS))
+save_figure(figure, "block8_01_imputation_check_" + example_sensor + ".png")
 
 
 # %% Block 9: First random forest
