@@ -1,0 +1,4 @@
+feature_set,features,TN,FP,FN,TP,accuracy,recall,precision,cost_eur,highest_fail_probability,wafers_at_or_above_0.3
+all sensors (Block 9),450,1170,0,83,0,0.9338,0.0,0.0,415000,0.45,29
+Boruta confirmed only,15,1169,1,82,1,0.9338,0.012,0.5,410200,0.6,43
+Boruta selected (D10),18,1168,2,80,3,0.9346,0.0361,0.6,400400,0.58,49

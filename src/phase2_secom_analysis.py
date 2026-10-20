@@ -115,7 +115,14 @@ import urllib.request
 from pathlib import Path
 import numpy as np
 import pandas as pd
+# The script only saves figures to files and never opens a window, so matplotlib
+# uses the file-only "Agg" backend. The default window backend (Tk) prints
+# "main thread is not in main loop" errors when Boruta's forest (n_jobs=-1)
+# runs in several threads. use() must come before pyplot is imported.
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
 from sklearn.model_selection import train_test_split
 # Phase 2 imports: scaling and kNN imputation (Block 8).
 from sklearn.preprocessing import MinMaxScaler
@@ -124,6 +131,8 @@ from sklearn.impute import KNNImputer
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import confusion_matrix
+# Phase 2 import: Boruta feature selection (Block 10).
+from boruta import BorutaPy
 
 
 # %% Block 1: Settings
@@ -169,6 +178,14 @@ KNN_NEIGHBORS = 5
 # parts (stratified, so each part keeps about 6.6 % failures). 5 is the manual's
 # choice and leaves about 17 failed wafers in each part to evaluate on.
 CV_FOLDS = 5
+
+# Phase 2 settings - Boruta feature selection: BORUTA_MAX_ITER is the maximum
+# number of rounds against the shadow features (100 is Boruta's default; 200
+# gave the same 15 confirmed sensors). KEEP_TENTATIVE (decision D10): True keeps
+# the tentative (borderline) sensors, as the manual's week 4 asks
+# ("including tentative ones").
+BORUTA_MAX_ITER = 100
+KEEP_TENTATIVE = True
 
 # Download links of the two original files in the UCI repository (dataset 179).
 URL_SENSOR_DATA = "https://archive.ics.uci.edu/ml/machine-learning-databases/secom/secom.data"
@@ -1330,45 +1347,61 @@ training_fit_results = evaluate_predictions(y_train, random_forest.predict(X_tra
 print(training_fit_results)
 
 
-# ----- 9.2 5-fold stratified cross-validation (written as a visible loop) -----
+# ----- 9.2 5-fold stratified cross-validation (a visible loop inside a function) -----
 print("\n--- 9.2 Random forest, " + str(CV_FOLDS) + "-fold stratified cross-validation ---")
 # StratifiedKFold cuts the training wafers into CV_FOLDS parts with the same
 # failure share. shuffle=True mixes the wafers first (they are in time order);
-# random_state=SEED makes the parts identical on every run.
+# random_state=SEED makes the parts identical on every run, so every model in
+# this script is evaluated on exactly the same five parts.
 cv_splitter = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=SEED)
 
-# Each wafer gets exactly one out-of-fold prediction: from the model trained
-# without its part.
-cv_predictions = pd.Series(0, index=y_train.index)
-cv_probabilities = pd.Series(0.0, index=y_train.index)
-fold_rows = []
-fold_number = 0
-for train_positions, validation_positions in cv_splitter.split(X_train_imputed, y_train):
-    fold_number = fold_number + 1
-    # iloc selects rows by position: 4 parts to learn from, 1 part to evaluate on.
-    X_fold_train = X_train_imputed.iloc[train_positions]
-    y_fold_train = y_train.iloc[train_positions]
-    X_fold_validation = X_train_imputed.iloc[validation_positions]
-    y_fold_validation = y_train.iloc[validation_positions]
 
-    # A new forest with the same settings for every fold, trained without the validation part.
-    fold_model = RandomForestClassifier(random_state=SEED)
-    fold_model.fit(X_fold_train, y_fold_train)
-    fold_predictions = fold_model.predict(X_fold_validation)
-    # predict_proba() gives [P(pass), P(fail)] per wafer; column 1 is the share of trees voting fail.
-    fold_probabilities = fold_model.predict_proba(X_fold_validation)[:, 1]
+def cross_validate_random_forest(X_data, y_data):
+    """
+    Evaluate a random forest (seed SEED, default settings) with the stratified
+    cross-validation parts of cv_splitter: for each part, a new forest learns
+    from the other parts and predicts this one, so every wafer is predicted
+    exactly once by a model that never saw it.
 
-    cv_predictions.loc[X_fold_validation.index] = fold_predictions
-    cv_probabilities.loc[X_fold_validation.index] = fold_probabilities
-    fold_result = evaluate_predictions(y_fold_validation, fold_predictions)
-    fold_result["fold"] = fold_number
-    fold_result["validation_wafers"] = len(y_fold_validation)
-    fold_result["failed_wafers"] = int(y_fold_validation.sum())
-    fold_rows.append(fold_result)
+    Input:  X_data (DataFrame of training features), y_data (Series of training labels)
+    Output: fold_table (DataFrame: one row of results per part),
+            cv_predictions (Series: out-of-fold predicted class per wafer),
+            cv_probabilities (Series: out-of-fold predicted failure probability per wafer)
+    """
+    cv_predictions = pd.Series(0, index=y_data.index)
+    cv_probabilities = pd.Series(0.0, index=y_data.index)
+    fold_rows = []
+    fold_number = 0
+    for train_positions, validation_positions in cv_splitter.split(X_data, y_data):
+        fold_number = fold_number + 1
+        # iloc selects rows by position: 4 parts to learn from, 1 part to evaluate on.
+        X_fold_train = X_data.iloc[train_positions]
+        y_fold_train = y_data.iloc[train_positions]
+        X_fold_validation = X_data.iloc[validation_positions]
+        y_fold_validation = y_data.iloc[validation_positions]
 
-fold_table = pd.DataFrame(fold_rows)
-fold_table = fold_table[["fold", "validation_wafers", "failed_wafers", "TN", "FP", "FN", "TP",
-                         "accuracy", "recall", "precision", "cost_eur"]]
+        # A new forest with the same settings for every part, trained without the validation part.
+        fold_model = RandomForestClassifier(random_state=SEED)
+        fold_model.fit(X_fold_train, y_fold_train)
+        fold_predictions = fold_model.predict(X_fold_validation)
+        # predict_proba() gives [P(pass), P(fail)] per wafer; column 1 is the share of trees voting fail.
+        fold_probabilities = fold_model.predict_proba(X_fold_validation)[:, 1]
+
+        cv_predictions.loc[X_fold_validation.index] = fold_predictions
+        cv_probabilities.loc[X_fold_validation.index] = fold_probabilities
+        fold_result = evaluate_predictions(y_fold_validation, fold_predictions)
+        fold_result["fold"] = fold_number
+        fold_result["validation_wafers"] = len(y_fold_validation)
+        fold_result["failed_wafers"] = int(y_fold_validation.sum())
+        fold_rows.append(fold_result)
+
+    fold_table = pd.DataFrame(fold_rows)
+    fold_table = fold_table[["fold", "validation_wafers", "failed_wafers", "TN", "FP", "FN", "TP",
+                             "accuracy", "recall", "precision", "cost_eur"]]
+    return fold_table, cv_predictions, cv_probabilities
+
+
+fold_table, cv_predictions, cv_probabilities = cross_validate_random_forest(X_train_imputed, y_train)
 print(fold_table.to_string(index=False))
 fold_table.to_csv(TABLES_FOLDER / "block9_cv_folds.csv", index=False)
 
@@ -1421,8 +1454,109 @@ figure.suptitle("First random forest on the training set (" + str(len(y_train)) 
 figure.subplots_adjust(top=0.80, wspace=0.45)
 save_figure(figure, "block9_01_confusion_matrices.png")
 
-# %% Block 10: Boruta feature selection
-# Select the informative sensors with Boruta on the training set (Phase 2).
+# %% Block 10: Boruta feature selection (training set only)
+# Keeps only the sensors that predict failure better than chance (manual week 4;
+# Section 7). Boruta compares every sensor with shuffled "shadow" copies over
+# many random-forest rounds and confirms, rejects or leaves it tentative.
+# It uses the label, so it is fitted on X_train_imputed / y_train only; the
+# list of selected sensors is the stored rule applied to the test set in Block 17.
+
+# ----- 10.1 Run Boruta -----
+print("\n--- 10.1 Boruta feature selection (training set) ---")
+# The forest inside Boruta: class_weight="balanced" weights each failed wafer by
+# about 1,170 / 83 so the few failures count as much as the many passes;
+# max_depth=5 keeps the trees shallow, as the Boruta documentation recommends,
+# which gives steadier importances; n_jobs=-1 uses all processor cores (faster,
+# same result); random_state=SEED makes it repeatable.
+boruta_forest = RandomForestClassifier(class_weight="balanced", max_depth=5,
+                                       n_jobs=-1, random_state=SEED)
+# n_estimators="auto" lets Boruta choose the number of trees from the number of
+# columns. Defaults kept: perc=100 (a sensor must beat the BEST shadow), alpha=0.05
+# (significance level), two_step=True (test corrected for testing 450 sensors).
+boruta_selector = BorutaPy(boruta_forest, n_estimators="auto", max_iter=BORUTA_MAX_ITER,
+                           random_state=SEED, verbose=0)
+# BorutaPy expects plain arrays, so .to_numpy() is passed; fitted on training data only.
+boruta_selector.fit(X_train_imputed.to_numpy(), y_train.to_numpy())
+
+# support_ marks confirmed sensors, support_weak_ tentative ones; all others are rejected.
+confirmed_features = X_train_imputed.columns[boruta_selector.support_].tolist()
+tentative_features = X_train_imputed.columns[boruta_selector.support_weak_].tolist()
+rejected_count = X_train_imputed.shape[1] - len(confirmed_features) - len(tentative_features)
+print("Confirmed:", len(confirmed_features), confirmed_features)
+print("Tentative:", len(tentative_features), tentative_features)
+print("Rejected: ", rejected_count)
+
+# Decision D10: the stored rule for the test set is this list of sensor names.
+selected_features = list(confirmed_features)
+if KEEP_TENTATIVE:
+    selected_features = selected_features + tentative_features
+print("Selected (KEEP_TENTATIVE =", str(KEEP_TENTATIVE) + "):", len(selected_features), "features")
+
+
+# ----- 10.2 Ranking table and chart -----
+# importance_history_ holds each sensor's importance in every round (missing once
+# a sensor is rejected); the median over the rounds summarises it robustly.
+median_importance = pd.Series(np.nanmedian(boruta_selector.importance_history_, axis=0),
+                              index=X_train_imputed.columns)
+status = pd.Series("rejected", index=X_train_imputed.columns)
+status[confirmed_features] = "confirmed"
+status[tentative_features] = "tentative"
+ranking_table = pd.DataFrame({"boruta_rank": boruta_selector.ranking_,
+                              "status": status,
+                              "median_importance": median_importance.round(6)})
+ranking_table = ranking_table.sort_values(["boruta_rank", "median_importance"], ascending=[True, False])
+ranking_table.to_csv(TABLES_FOLDER / "block10_boruta_ranking.csv", index_label="sensor")
+
+# Horizontal bar chart of the 30 highest-ranked sensors, coloured by status
+# (green confirmed, yellow tentative, grey rejected), most important at the top.
+top_ranked = ranking_table.head(30).iloc[::-1]
+status_colors = {"confirmed": "#008300", "tentative": "#eda100", "rejected": "#a6a6a6"}
+bar_colors = []
+for sensor_status in top_ranked["status"]:
+    bar_colors.append(status_colors[sensor_status])
+figure, axis = plt.subplots(figsize=(8, 8))
+axis.barh(top_ranked.index, top_ranked["median_importance"], color=bar_colors)
+# Legend: one coloured square (Patch) per status.
+legend_handles = []
+for sensor_status in ["confirmed", "tentative", "rejected"]:
+    legend_handles.append(Patch(color=status_colors[sensor_status], label=sensor_status))
+axis.legend(handles=legend_handles, loc="lower right")
+axis.set_xlabel("Median importance over Boruta rounds")
+axis.set_title("Boruta ranking, training set: " + str(len(confirmed_features)) + " confirmed, "
+               + str(len(tentative_features)) + " tentative, " + str(rejected_count) + " rejected\n"
+               + "(30 highest-ranked of " + str(X_train_imputed.shape[1]) + " sensors)")
+axis.spines["top"].set_visible(False)
+axis.spines["right"].set_visible(False)
+save_figure(figure, "block10_01_boruta_ranking.png")
+
+
+# ----- 10.3 Random forest with the selected sensors vs. Block 9 -----
+print("\n--- 10.3 Cross-validated random forest: all vs. selected sensors ---")
+# The same function, the same five parts and the same forest settings as in
+# Block 9, so the only difference between the rows is the set of sensors.
+feature_sets = {"all sensors (Block 9)": list(X_train_imputed.columns),
+                "Boruta confirmed only": confirmed_features,
+                "Boruta selected (D10)": selected_features}
+comparison_rows = []
+for set_name in feature_sets:
+    columns = feature_sets[set_name]
+    folds, predictions, probabilities = cross_validate_random_forest(X_train_imputed[columns], y_train)
+    row = evaluate_predictions(y_train, predictions)
+    row["feature_set"] = set_name
+    row["features"] = len(columns)
+    row["highest_fail_probability"] = round(float(probabilities.max()), 3)
+    row["wafers_at_or_above_0.3"] = int((probabilities >= 0.3).sum())
+    comparison_rows.append(row)
+selection_comparison = pd.DataFrame(comparison_rows)
+selection_comparison = selection_comparison[["feature_set", "features", "TN", "FP", "FN", "TP",
+                                             "accuracy", "recall", "precision", "cost_eur",
+                                             "highest_fail_probability", "wafers_at_or_above_0.3"]]
+print(selection_comparison.to_string(index=False))
+selection_comparison.to_csv(TABLES_FOLDER / "block10_cv_comparison.csv", index=False)
+
+# Processed data: the training set with only the selected sensors (scaled, imputed).
+X_train_selected = X_train_imputed[selected_features]
+save_processed(X_train_selected, y_train, "block10_train_selected.csv")
 
 # %% Block 11: Balancing
 # Balance the training set with SMOTE or ROSE; the test set is never balanced (Phase 2).
