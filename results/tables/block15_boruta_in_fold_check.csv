@@ -1,0 +1,6 @@
+fold,average_precision_fixed_18,average_precision_boruta_in_fold,sensors_chosen_in_fold,of_them_among_fixed_18
+1,0.2249,0.1387,19,13
+2,0.2241,0.1796,16,12
+3,0.3681,0.3803,9,9
+4,0.3684,0.2324,26,13
+5,0.3022,0.2272,15,11

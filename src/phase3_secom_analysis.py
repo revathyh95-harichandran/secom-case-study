@@ -151,6 +151,10 @@ from sklearn.naive_bayes import GaussianNB
 from sklearn.dummy import DummyClassifier
 from sklearn.metrics import average_precision_score
 from imblearn.ensemble import BalancedRandomForestClassifier, EasyEnsembleClassifier
+# Phase 3 imports: grid search and timing (Block 15).
+import time
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import make_scorer, fbeta_score
 
 
 # %% Block 1: Settings
@@ -2341,3 +2345,276 @@ voting_check = pd.DataFrame([{"ensemble": "soft vote of " + " | ".join(shortlist
 print(voting_check.T.to_string(header=False))
 voting_check.to_csv(TABLES_FOLDER / "block14_voting_check.csv", index=False)
 print("Soft-voting ensemble kept (D17):", keep_voting)
+
+
+# %% Block 15: Grid search on the five shortlisted pairs (training set only)
+# Tunes a few settings of each shortlisted model-balancing pair from Block 14:
+# the outlier treatment (three versions of the training data, all made with the
+# stored Block 7 bounds), k of the kNN imputer and one setting of the model.
+# Every setting is scored on the same five CV parts by mean average precision
+# (D15); F2 at threshold 0.5 is reported alongside. Grid search rather than
+# randomised search, because this grid is small enough to try in full (D14).
+# The final model is not chosen here: all five tuned pairs go to the threshold
+# step (Block 16). A last check refits Boruta inside every fold for the best
+# pair (manual 7.5). Manual Section 11. The test set is not used in this block.
+
+
+def fold_scores_from_search(search_results, row_number, score_name):
+    """
+    Read the five fold scores of one setting from a fitted GridSearchCV.
+
+    Input:  search_results (dict: cv_results_ of GridSearchCV), row_number (int:
+            which setting), score_name (str: "average_precision" or "F2")
+    Output: array with one score per CV part
+    """
+    scores = []
+    for part in range(CV_FOLDS):
+        scores.append(search_results["split" + str(part) + "_test_" + score_name][row_number])
+    return np.array(scores)
+
+
+def cross_validate_with_boruta(X_data, y_data, family, balancing, n_neighbors, setting_name, setting_value):
+    """
+    Cross-validate one tuned pair with Boruta refitted inside every training
+    part, instead of the fixed 18 sensors, to measure how optimistic the fixed
+    list made the scores (manual 7.5).
+
+    Input:  X_data (DataFrame, one outlier version), y_data (Series), family and
+            balancing (str), n_neighbors (int), setting_name (str) and
+            setting_value (the tuned model setting)
+    Output: precisions (array: average precision per part), sensor_counts and
+            shared_counts (lists: sensors chosen per part, and how many of them
+            are among the fixed 18)
+    """
+    precisions = []
+    sensor_counts = []
+    shared_counts = []
+    for train_positions, validation_positions in cv_splitter.split(X_data, y_data):
+        X_part_train = X_data.iloc[train_positions]
+        y_part_train = y_data.iloc[train_positions]
+        X_part_validation = X_data.iloc[validation_positions]
+        y_part_validation = y_data.iloc[validation_positions]
+        # Scaling and imputation are learned on this training part only and then
+        # applied to both parts, exactly as the pipeline does.
+        scaler_part = MinMaxScaler().fit(X_part_train)
+        imputer_part = KNNImputer(n_neighbors=n_neighbors).fit(scaler_part.transform(X_part_train))
+        train_ready = imputer_part.transform(scaler_part.transform(X_part_train))
+        validation_ready = imputer_part.transform(scaler_part.transform(X_part_validation))
+        # Boruta with the Block 10 settings, fitted on this training part only.
+        forest_part = RandomForestClassifier(class_weight="balanced", max_depth=5,
+                                             n_jobs=None, random_state=SEED)
+        boruta_part = BorutaPy(forest_part, n_estimators="auto", max_iter=BORUTA_MAX_ITER,
+                               random_state=SEED, verbose=0)
+        boruta_part.fit(train_ready, y_part_train.to_numpy())
+        # Confirmed sensors, plus tentative ones if KEEP_TENTATIVE (D10);
+        # "|" combines the two True/False lists ("or" per sensor).
+        keep = boruta_part.support_.copy()
+        if KEEP_TENTATIVE:
+            keep = keep | boruta_part.support_weak_
+        positions = np.where(keep)[0]
+        if len(positions) == 0:
+            raise ValueError("Boruta kept no sensor in one fold.")
+        # Balancing (training part only) and the tuned model. set_params takes
+        # the setting by name; ** turns the small dictionary into name=value.
+        model = make_model(family, balancing)
+        model.set_params(**{setting_name: setting_value})
+        rest_of_pipeline = Pipeline([("balancer", make_sampler(balancing)), ("model", model)])
+        rest_of_pipeline.fit(train_ready[:, positions], y_part_train)
+        probabilities = rest_of_pipeline.predict_proba(validation_ready[:, positions])[:, 1]
+        precisions.append(average_precision_score(y_part_validation, probabilities))
+        # How many of the chosen sensors are also among the fixed 18?
+        shared = 0
+        for position in positions:
+            if X_data.columns[position] in selected_features:
+                shared = shared + 1
+        sensor_counts.append(len(positions))
+        shared_counts.append(shared)
+    return np.array(precisions), sensor_counts, shared_counts
+
+
+# ----- 15.1 The search space (fixed before the run, DECISIONS.md 20 Oct) -----
+# The three outlier options of Block 7 (D7); "cap" is the current choice.
+GRID_OUTLIER_OPTIONS = ["nothing", "cap", "remove"]
+# k of the kNN imputer: the manual's 5 and one step below and above.
+GRID_NEIGHBORS = [3, 5, 7]
+# One setting per model family: (name, three values, default used in Block 14).
+# Each list contains the default, so tuning can always fall back to it.
+MODEL_SETTINGS = {
+    # Number of balanced AdaBoost sub-models: more sub-models see more of the
+    # 1,170 passed wafers.
+    "easy_ensemble": ("n_estimators", [10, 25, 50], 10),
+    # Fewest wafers allowed in a leaf: larger leaves stop the trees memorising
+    # single (or copied) failed wafers.
+    "random_forest": ("min_samples_leaf", [1, 5, 10], 1),
+    "balanced_random_forest": ("min_samples_leaf", [1, 5, 10], 1),
+    # Size of each boosting correction: smaller steps learn more carefully.
+    "gradient_boosting": ("learning_rate", [0.03, 0.1, 0.3], 0.1),
+    # Inverse penalty strength: a smaller C gives a simpler, steadier boundary.
+    "logistic_regression": ("C", [0.01, 0.1, 1.0], 1.0),
+}
+
+
+# ----- 15.2 Three versions of the training data (outlier options) -----
+print("\n--- 15.2 Outlier versions of the training set (stored Block 7 bounds) ---")
+outlier_versions = {}
+for option in GRID_OUTLIER_OPTIONS:
+    outlier_versions[option] = apply_outlier_treatment(option, X_train_reduced, lower_bounds, upper_bounds)
+    print("  " + option.ljust(8), "shape", outlier_versions[option].shape,
+          "| gaps for the imputer:", int(outlier_versions[option].isna().sum().sum()))
+# The "cap" version must be exactly the data used in Blocks 13 and 14.
+print("'cap' version identical to the Block 13/14 input:", outlier_versions["cap"].equals(X_pipeline_input))
+
+
+# ----- 15.3 Grid search -----
+print("\n--- 15.3 Grid search: 5 pairs x 3 outlier versions x 3 k x 3 model settings, 5-fold CV ---")
+# Two scores per setting. Average precision is built with make_scorer and
+# response_method="predict_proba", so it ranks wafers by failure probability
+# exactly as in Block 14 (the built-in name "average_precision" would use
+# decision_function where a model has one). F2 uses the 0/1 predictions at the
+# default threshold 0.5; zero_division=0 gives 0 instead of a warning when a
+# fold has no predicted failure.
+grid_scoring = {"average_precision": make_scorer(average_precision_score, response_method="predict_proba"),
+                "F2": make_scorer(fbeta_score, beta=2, zero_division=0)}
+
+grid_rows = []
+grid_fold_precisions = {}
+grid_start_time = time.perf_counter()
+for family, balancing in shortlist_pairs:
+    pair_name = family + " + " + balancing
+    setting_name, setting_values, setting_default = MODEL_SETTINGS[family]
+    # GridSearchCV names a pipeline step's setting "<step name>__<setting>".
+    param_grid = {"imputer__n_neighbors": GRID_NEIGHBORS,
+                  "model__" + setting_name: setting_values}
+    pair_start_time = time.perf_counter()
+    for option in GRID_OUTLIER_OPTIONS:
+        # GridSearchCV fits a fresh copy of the pipeline for every setting and
+        # every fold, so all steps are refitted inside each fold. cv=cv_splitter:
+        # the same five parts as before. refit=False: no model on the whole
+        # training set here (that is Block 17). n_jobs=None (default): one
+        # thread, as for Boruta. error_score="raise": a failing setting stops the
+        # script instead of the default silent NaN score.
+        search = GridSearchCV(build_pipeline(make_model(family, balancing), balancing),
+                              param_grid=param_grid, scoring=grid_scoring, cv=cv_splitter,
+                              refit=False, n_jobs=None, error_score="raise")
+        search.fit(outlier_versions[option], y_train)
+        results = search.cv_results_
+        # One row per setting; the standard deviation uses ddof=1 as in Block 14
+        # (GridSearchCV's own std_test columns use ddof=0).
+        for row_number in range(len(results["params"])):
+            settings = results["params"][row_number]
+            k_value = settings["imputer__n_neighbors"]
+            model_value = settings["model__" + setting_name]
+            precisions = fold_scores_from_search(results, row_number, "average_precision")
+            f2_values = fold_scores_from_search(results, row_number, "F2")
+            grid_fold_precisions[(pair_name, option, k_value, model_value)] = precisions
+            grid_rows.append({"pair": pair_name, "family": family, "balancing": balancing,
+                              "outlier": option, "k": k_value,
+                              "setting": setting_name, "value": model_value,
+                              "mean_average_precision": round(float(precisions.mean()), 4),
+                              "std_average_precision": round(float(precisions.std(ddof=1)), 4),
+                              "mean_F2_at_0.5": round(float(f2_values.mean()), 4)})
+    print("  " + pair_name.ljust(34), "27 settings x 5 folds done in",
+          round(time.perf_counter() - pair_start_time), "s")
+grid_table = pd.DataFrame(grid_rows)
+grid_table.to_csv(TABLES_FOLDER / "block15_grid_results.csv", index=False)
+print("Grid search finished in", round(time.perf_counter() - grid_start_time), "s;",
+      len(grid_table), "settings scored")
+
+
+# ----- 15.4 Best setting per pair, checks and chart -----
+print("\n--- 15.4 Best setting per pair (highest mean average precision) ---")
+best_rows = []
+tuned_candidates = []
+for family, balancing in shortlist_pairs:
+    pair_name = family + " + " + balancing
+    setting_name, setting_values, setting_default = MODEL_SETTINGS[family]
+    pair_rows = grid_table[grid_table["pair"] == pair_name]
+    # kind="stable" keeps the grid order for exact ties, so the first setting wins.
+    best = pair_rows.sort_values("mean_average_precision", ascending=False, kind="stable").iloc[0]
+    best_precisions = grid_fold_precisions[(pair_name, best["outlier"], best["k"], best["value"])]
+    default_precisions = grid_fold_precisions[(pair_name, "cap", KNN_NEIGHBORS, setting_default)]
+    # Check: the default setting must reproduce Block 14's fold scores exactly.
+    matches_block14 = bool(np.allclose(default_precisions, combination_average_precisions[pair_name]))
+    # Gain over the default, judged against the spread of the fold differences
+    # (the same rule as the D17 voting check).
+    gain_per_fold = best_precisions - default_precisions
+    # Edge check: a best value at the end of its range may mean the best lies outside it.
+    k_at_edge = best["k"] == min(GRID_NEIGHBORS) or best["k"] == max(GRID_NEIGHBORS)
+    value_at_edge = best["value"] == setting_values[0] or best["value"] == setting_values[-1]
+    best_rows.append({"pair": pair_name, "outlier": best["outlier"], "k": best["k"],
+                      "setting": setting_name, "value": best["value"],
+                      "tuned_average_precision": best["mean_average_precision"],
+                      "tuned_std": best["std_average_precision"],
+                      "default_average_precision": round(float(default_precisions.mean()), 4),
+                      "mean_gain": round(float(gain_per_fold.mean()), 4),
+                      "std_of_gains": round(float(gain_per_fold.std(ddof=1)), 4),
+                      "gain_beyond_noise": float(gain_per_fold.mean()) > float(gain_per_fold.std(ddof=1)),
+                      "k_at_edge": k_at_edge, "value_at_edge": value_at_edge,
+                      "default_matches_block14": matches_block14})
+    # The tuned settings of every pair, handed on to Block 16. The "value" column
+    # mixes whole numbers and decimals, so pandas stores 10 as 10.0; the value is
+    # taken back from the original list, because n_estimators must be a whole number.
+    tuned_value = None
+    for value in setting_values:
+        if value == best["value"]:
+            tuned_value = value
+    tuned_candidates.append({"family": family, "balancing": balancing, "outlier": best["outlier"],
+                             "k": int(best["k"]), "setting": setting_name, "value": tuned_value})
+best_settings = pd.DataFrame(best_rows).sort_values("tuned_average_precision", ascending=False)
+print(best_settings.to_string(index=False))
+best_settings.to_csv(TABLES_FOLDER / "block15_best_settings.csv", index=False)
+
+# Chart: default (Block 14) vs. tuned mean average precision per pair, with
+# +/- one standard deviation over the folds.
+chart_positions = np.arange(len(best_settings))
+figure, axis = plt.subplots(figsize=(10, 5))
+default_stds = []
+for pair_name in best_settings["pair"]:
+    family = pair_name.split(" + ")[0]
+    default_key = (pair_name, "cap", KNN_NEIGHBORS, MODEL_SETTINGS[family][2])
+    default_stds.append(float(grid_fold_precisions[default_key].std(ddof=1)))
+axis.bar(chart_positions - 0.2, best_settings["default_average_precision"], width=0.4,
+         yerr=default_stds, capsize=3, color="#a6a6a6", label="default (Block 14)")
+axis.bar(chart_positions + 0.2, best_settings["tuned_average_precision"], width=0.4,
+         yerr=best_settings["tuned_std"], capsize=3, color=COLOR_MAIN, label="tuned (best setting)")
+axis.axhline(float(y_train.mean()), linestyle="--", color=COLOR_REFERENCE,
+             label="random guess = failure share (" + str(round(float(y_train.mean()), 3)) + ")")
+axis.set_xticks(chart_positions)
+axis.set_xticklabels(best_settings["pair"].str.replace(" + ", "\n+ ", regex=False), fontsize=8)
+axis.set_ylabel("Average precision, mean over 5 folds")
+axis.set_title("Grid search: default vs. tuned settings (training set, 5-fold CV)")
+# The y-axis goes up to 0.5 so the legend fits above the error bars (highest about 0.37).
+axis.set_ylim(0, 0.5)
+axis.legend(fontsize=8, loc="upper right", ncol=3)
+axis.spines["top"].set_visible(False)
+axis.spines["right"].set_visible(False)
+save_figure(figure, "block15_01_default_vs_tuned.png")
+
+
+# ----- 15.5 Boruta refitted inside every fold, for the best tuned pair -----
+best_candidate = None
+for candidate in tuned_candidates:
+    if candidate["family"] + " + " + candidate["balancing"] == best_settings.iloc[0]["pair"]:
+        best_candidate = candidate
+best_pair_name = best_candidate["family"] + " + " + best_candidate["balancing"]
+print("\n--- 15.5 Boruta inside every fold:", best_pair_name, "with its tuned settings ---")
+boruta_start_time = time.perf_counter()
+in_fold_precisions, sensor_counts, shared_counts = cross_validate_with_boruta(
+    outlier_versions[best_candidate["outlier"]], y_train, best_candidate["family"],
+    best_candidate["balancing"], best_candidate["k"], best_candidate["setting"], best_candidate["value"])
+fixed_precisions = grid_fold_precisions[(best_pair_name, best_candidate["outlier"],
+                                         best_candidate["k"], best_candidate["value"])]
+boruta_rows = []
+for part in range(CV_FOLDS):
+    boruta_rows.append({"fold": part + 1,
+                        "average_precision_fixed_18": round(float(fixed_precisions[part]), 4),
+                        "average_precision_boruta_in_fold": round(float(in_fold_precisions[part]), 4),
+                        "sensors_chosen_in_fold": sensor_counts[part],
+                        "of_them_among_fixed_18": shared_counts[part]})
+boruta_check = pd.DataFrame(boruta_rows)
+print(boruta_check.to_string(index=False))
+boruta_check.to_csv(TABLES_FOLDER / "block15_boruta_in_fold_check.csv", index=False)
+print("Mean average precision: fixed 18 sensors", round(float(fixed_precisions.mean()), 4),
+      "| Boruta inside the folds", round(float(in_fold_precisions.mean()), 4),
+      "| optimism of the fixed list", round(float(fixed_precisions.mean() - in_fold_precisions.mean()), 4))
+print("Boruta check finished in", round(time.perf_counter() - boruta_start_time), "s")
