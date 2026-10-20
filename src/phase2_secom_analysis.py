@@ -120,6 +120,10 @@ from sklearn.model_selection import train_test_split
 # Phase 2 imports: scaling and kNN imputation (Block 8).
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.impute import KNNImputer
+# Phase 2 imports: first model and cross-validation (Block 9).
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import confusion_matrix
 
 
 # %% Block 1: Settings
@@ -160,6 +164,11 @@ OUTLIER_TREATMENT = "cap"
 # average of the KNN_NEIGHBORS most similar training wafers. 5 is the manual's
 # required starting point; it stays a setting so the grid search can try 3 to 9.
 KNN_NEIGHBORS = 5
+
+# Phase 2 setting - cross-validation: the training set is cut into CV_FOLDS
+# parts (stratified, so each part keeps about 6.6 % failures). 5 is the manual's
+# choice and leaves about 17 failed wafers in each part to evaluate on.
+CV_FOLDS = 5
 
 # Download links of the two original files in the UCI repository (dataset 179).
 URL_SENSOR_DATA = "https://archive.ics.uci.edu/ml/machine-learning-databases/secom/secom.data"
@@ -1273,8 +1282,144 @@ figure.suptitle(example_sensor + " (" + str(round(missing_percent_before[example
 save_figure(figure, "block8_01_imputation_check_" + example_sensor + ".png")
 
 
-# %% Block 9: First random forest
-# Train a first random forest and report its metrics (Phase 2).
+# %% Block 9: First random forest - training fit vs. cross-validation
+# Trains a first random forest on the imputed training data (manual week 3,
+# step 5; Section 11.2) and evaluates it twice: on the same wafers it learned
+# from (training fit) and with 5-fold stratified cross-validation, where every
+# wafer is predicted by a model that never saw it. Only the training set is
+# used; the test set stays locked.
+
+
+def evaluate_predictions(y_true, y_pred):
+    """
+    Compute the confusion matrix, the usual metrics and the total cost.
+
+    Input:  y_true (Series or array of true labels, 1 = fail), y_pred (predicted labels)
+    Output: dictionary with TN, FP, FN, TP, accuracy, recall, precision,
+            specificity, F1 and total cost in euros
+    """
+    # labels=[0, 1] fixes the order (pass, fail) and keeps a 2 x 2 matrix even
+    # if one class is never predicted. ravel() reads it as TN, FP, FN, TP.
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    total = tn + fp + fn + tp
+    # Each ratio is set to 0 when its denominator is 0 (for example precision
+    # when no wafer is predicted as failed), instead of dividing by zero.
+    accuracy = (tp + tn) / total
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    cost = COST_FALSE_POSITIVE * fp + COST_FALSE_NEGATIVE * fn
+    # int() and float() turn numpy numbers into plain Python numbers, so they print cleanly.
+    return {"TN": int(tn), "FP": int(fp), "FN": int(fn), "TP": int(tp),
+            "accuracy": round(float(accuracy), 4), "recall": round(float(recall), 4),
+            "precision": round(float(precision), 4), "specificity": round(float(specificity), 4),
+            "F1": round(float(f1), 4), "cost_eur": int(cost)}
+
+
+# ----- 9.1 Training fit: the model is scored on the wafers it learned from -----
+print("\n--- 9.1 Random forest, training fit ---")
+# Defaults used (scikit-learn 1.9.1): n_estimators=100 trees; max_features="sqrt"
+# (each split chooses among about 21 of the 450 sensors); bootstrap=True (each
+# tree learns from a random sample of wafers drawn with replacement); no depth
+# limit; no class weights. random_state=SEED makes the forest identical on every run.
+random_forest = RandomForestClassifier(random_state=SEED)
+random_forest.fit(X_train_imputed, y_train)
+# predict() calls a wafer "fail" when more than half of the trees vote fail (threshold 0.5).
+training_fit_results = evaluate_predictions(y_train, random_forest.predict(X_train_imputed))
+print(training_fit_results)
+
+
+# ----- 9.2 5-fold stratified cross-validation (written as a visible loop) -----
+print("\n--- 9.2 Random forest, " + str(CV_FOLDS) + "-fold stratified cross-validation ---")
+# StratifiedKFold cuts the training wafers into CV_FOLDS parts with the same
+# failure share. shuffle=True mixes the wafers first (they are in time order);
+# random_state=SEED makes the parts identical on every run.
+cv_splitter = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=SEED)
+
+# Each wafer gets exactly one out-of-fold prediction: from the model trained
+# without its part.
+cv_predictions = pd.Series(0, index=y_train.index)
+cv_probabilities = pd.Series(0.0, index=y_train.index)
+fold_rows = []
+fold_number = 0
+for train_positions, validation_positions in cv_splitter.split(X_train_imputed, y_train):
+    fold_number = fold_number + 1
+    # iloc selects rows by position: 4 parts to learn from, 1 part to evaluate on.
+    X_fold_train = X_train_imputed.iloc[train_positions]
+    y_fold_train = y_train.iloc[train_positions]
+    X_fold_validation = X_train_imputed.iloc[validation_positions]
+    y_fold_validation = y_train.iloc[validation_positions]
+
+    # A new forest with the same settings for every fold, trained without the validation part.
+    fold_model = RandomForestClassifier(random_state=SEED)
+    fold_model.fit(X_fold_train, y_fold_train)
+    fold_predictions = fold_model.predict(X_fold_validation)
+    # predict_proba() gives [P(pass), P(fail)] per wafer; column 1 is the share of trees voting fail.
+    fold_probabilities = fold_model.predict_proba(X_fold_validation)[:, 1]
+
+    cv_predictions.loc[X_fold_validation.index] = fold_predictions
+    cv_probabilities.loc[X_fold_validation.index] = fold_probabilities
+    fold_result = evaluate_predictions(y_fold_validation, fold_predictions)
+    fold_result["fold"] = fold_number
+    fold_result["validation_wafers"] = len(y_fold_validation)
+    fold_result["failed_wafers"] = int(y_fold_validation.sum())
+    fold_rows.append(fold_result)
+
+fold_table = pd.DataFrame(fold_rows)
+fold_table = fold_table[["fold", "validation_wafers", "failed_wafers", "TN", "FP", "FN", "TP",
+                         "accuracy", "recall", "precision", "cost_eur"]]
+print(fold_table.to_string(index=False))
+fold_table.to_csv(TABLES_FOLDER / "block9_cv_folds.csv", index=False)
+
+# All five validation parts together: every training wafer predicted once by a model that never saw it.
+cross_validation_results = evaluate_predictions(y_train, cv_predictions)
+print("All folds together:", cross_validation_results)
+print("Highest predicted failure probability:", round(cv_probabilities.max(), 3),
+      "| wafers with probability >= 0.5:", (cv_probabilities >= 0.5).sum(),
+      "| >= 0.3:", (cv_probabilities >= 0.3).sum())
+
+
+# ----- 9.3 Side by side: training fit vs. cross-validation -----
+comparison_table = pd.DataFrame([training_fit_results, cross_validation_results],
+                                index=["training fit (seen wafers)",
+                                       str(CV_FOLDS) + "-fold CV (unseen wafers)"])
+print("\n" + comparison_table.to_string())
+comparison_table.to_csv(TABLES_FOLDER / "block9_train_vs_cv.csv", index_label="evaluation")
+
+# Two confusion matrices side by side. Rows = true class, columns = predicted
+# class; each cell shows its count. One blue scale for both (vmin/vmax fixed).
+figure, axes = plt.subplots(1, 2, figsize=(10, 4.5))
+panel_results = [training_fit_results, cross_validation_results]
+panel_titles = ["Training fit (wafers the model has seen)",
+                str(CV_FOLDS) + "-fold CV (wafers the model has not seen)"]
+for position in range(2):
+    result = panel_results[position]
+    matrix = np.array([[result["TN"], result["FP"]], [result["FN"], result["TP"]]])
+    axis = axes[position]
+    axis.imshow(matrix, cmap="Blues", vmin=0, vmax=len(y_train))
+    cell_labels = [["TN", "FP"], ["FN", "TP"]]
+    for row in range(2):
+        for column in range(2):
+            count = matrix[row, column]
+            # Dark cells get white text, light cells dark text, so every number stays readable.
+            text_color = "white" if count > len(y_train) / 2 else "#222222"
+            axis.text(column, row, cell_labels[row][column] + "\n" + str(count),
+                      ha="center", va="center", fontsize=13, color=text_color)
+    axis.set_xticks([0, 1])
+    axis.set_xticklabels(["Pass (0)", "Fail (1)"])
+    axis.set_yticks([0, 1])
+    axis.set_yticklabels(["Pass (0)", "Fail (1)"])
+    axis.set_xlabel("Predicted class")
+    axis.set_ylabel("True class")
+    axis.set_title(panel_titles[position] + "\nrecall " + str(result["recall"])
+                   + " | accuracy " + str(result["accuracy"]) + " | cost EUR " + format(result["cost_eur"], ","),
+                   fontsize=10)
+figure.suptitle("First random forest on the training set (" + str(len(y_train)) + " wafers, "
+                + str(int(y_train.sum())) + " failed)")
+# Extra space between the panels and below the main title so no labels overlap.
+figure.subplots_adjust(top=0.80, wspace=0.45)
+save_figure(figure, "block9_01_confusion_matrices.png")
 
 # %% Block 10: Boruta feature selection
 # Select the informative sensors with Boruta on the training set (Phase 2).
