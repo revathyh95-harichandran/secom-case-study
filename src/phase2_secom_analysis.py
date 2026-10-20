@@ -136,6 +136,8 @@ from boruta import BorutaPy
 # Phase 2 imports: balancing (Block 11).
 from imblearn.over_sampling import SMOTE, ADASYN, RandomOverSampler
 from sklearn.neighbors import NearestNeighbors
+# Phase 2 imports: evaluation (Block 12).
+from sklearn.metrics import roc_auc_score, roc_curve
 
 
 # %% Block 1: Settings
@@ -1789,5 +1791,164 @@ print("Training set after", BALANCING_METHOD + ":", int((y_train_balanced == 0).
       int((y_train_balanced == 1).sum()), "fail")
 save_processed(X_train_balanced, y_train_balanced, "block11_train_balanced_" + BALANCING_METHOD.lower() + ".csv")
 
-# %% Block 12: Evaluation helpers
-# Functions for the confusion matrix, metrics, ROC curve and total cost (Phase 2).
+# %% Block 12: Evaluation helpers and detailed assessment of the current best model
+# Functions that turn true labels, predicted labels and predicted failure
+# probabilities into the confusion matrix (as a figure), accuracy, recall,
+# specificity, precision, F1, F2, ROC-AUC with the ROC curve, and total cost
+# (manual week 4 step 4; Section 13). They are applied to the cross-validated
+# predictions of the current best model: random forest + 18 Boruta sensors +
+# ROSE inside each training fold. The test set stays locked (used once, Phase 3).
+
+
+def full_evaluation(y_true, y_pred, probabilities):
+    """
+    All metrics for one set of predictions: the confusion-matrix values,
+    accuracy, recall, specificity, precision, F1 and cost from
+    evaluate_predictions (Block 9), plus F2 and ROC-AUC.
+
+    Input:  y_true (true labels, 1 = fail), y_pred (predicted labels),
+            probabilities (predicted failure probabilities, same order)
+    Output: dictionary with all values
+    """
+    result = evaluate_predictions(y_true, y_pred)
+    precision = result["precision"]
+    recall = result["recall"]
+    # F2 weights recall twice as much as precision: 5PR / (4P + R).
+    if 4 * precision + recall > 0:
+        result["F2"] = round(5 * precision * recall / (4 * precision + recall), 4)
+    else:
+        result["F2"] = 0.0
+    # ROC-AUC uses the probabilities, not the 0.5 decision: the chance that a
+    # random failed wafer gets a higher failure probability than a random passed one.
+    result["ROC_AUC"] = round(float(roc_auc_score(y_true, probabilities)), 4)
+    return result
+
+
+def plot_confusion_matrix(y_true, y_pred, title, file_name):
+    """
+    Draw a labelled confusion matrix (rows = true class, columns = predicted
+    class) with the count and the cost of each cell, and save it.
+
+    Input:  y_true (true labels), y_pred (predicted labels), title (str), file_name (str)
+    Output: none (the figure is saved)
+    """
+    result = evaluate_predictions(y_true, y_pred)
+    matrix = np.array([[result["TN"], result["FP"]], [result["FN"], result["TP"]]])
+    cell_names = [["TN\ngood wafer passed", "FP (Type I error)\ngood wafer flagged"],
+                  ["FN (Type II error)\nfailed wafer missed", "TP\nfailed wafer caught"]]
+    cell_costs = [[0, COST_FALSE_POSITIVE], [COST_FALSE_NEGATIVE, 0]]
+    figure, axis = plt.subplots(figsize=(7, 5.5))
+    # One blue scale from 0 to the number of wafers, so cells are comparable.
+    axis.imshow(matrix, cmap="Blues", vmin=0, vmax=matrix.sum())
+    for row in range(2):
+        for column in range(2):
+            count = matrix[row, column]
+            cell_cost = count * cell_costs[row][column]
+            text_color = "white" if count > matrix.sum() / 2 else "#222222"
+            axis.text(column, row, cell_names[row][column] + "\n" + str(count)
+                      + "\ncost EUR " + format(int(cell_cost), ","),
+                      ha="center", va="center", fontsize=10, color=text_color)
+    axis.set_xticks([0, 1])
+    axis.set_xticklabels(["Predicted pass (0)", "Predicted fail (1)"])
+    axis.set_yticks([0, 1])
+    axis.set_yticklabels(["True pass (0)", "True fail (1)"])
+    axis.set_title(title + "\nrecall " + str(result["recall"]) + " | precision " + str(result["precision"])
+                   + " | total cost EUR " + format(result["cost_eur"], ","), fontsize=10)
+    save_figure(figure, file_name)
+
+
+def plot_roc_curve(y_true, probabilities, y_pred, title, file_name):
+    """
+    Draw the ROC curve (true-positive rate against false-positive rate over
+    all thresholds) with its AUC, the diagonal of a random guess, and the
+    point of the actual predictions, and save it.
+
+    Input:  y_true (true labels), probabilities (predicted failure probabilities),
+            y_pred (predicted labels, marked as one point), title (str), file_name (str)
+    Output: none (the figure is saved)
+    """
+    # roc_curve() tries every threshold and returns the false-positive rate
+    # (1 - specificity) and the true-positive rate (recall) for each.
+    false_positive_rate, true_positive_rate, thresholds = roc_curve(y_true, probabilities)
+    auc = roc_auc_score(y_true, probabilities)
+    result = evaluate_predictions(y_true, y_pred)
+    figure, axis = plt.subplots(figsize=(6, 6))
+    axis.plot(false_positive_rate, true_positive_rate, linewidth=2, color=COLOR_MAIN,
+              label="Model (AUC = " + str(round(auc, 3)) + ")")
+    axis.plot([0, 1], [0, 1], linestyle="--", color=COLOR_REFERENCE, label="Random guess (AUC = 0.5)")
+    axis.plot(1 - result["specificity"], result["recall"], marker="o", markersize=9, color=COLOR_FAIL,
+              linestyle="none", label="Threshold 0.5 (recall " + str(result["recall"]) + ")")
+    axis.set_xlabel("False-positive rate (good wafers flagged)")
+    axis.set_ylabel("True-positive rate = recall (failed wafers caught)")
+    axis.set_title(title, fontsize=10)
+    axis.legend(loc="lower right")
+    axis.spines["top"].set_visible(False)
+    axis.spines["right"].set_visible(False)
+    save_figure(figure, file_name)
+
+
+# ----- 12.1 Cross-validated predictions of the current best model -----
+print("\n--- 12.1 Detailed assessment: random forest + 18 sensors + " + BALANCING_METHOD + " (5-fold CV) ---")
+# Same function, same five parts as Blocks 9 to 11. Every probability comes
+# from a model that did not see that wafer; balancing only in the training parts.
+best_folds, best_predictions, best_probabilities = cross_validate_random_forest(
+    X_train_selected, y_train, BALANCING_METHOD)
+no_balancing_folds, no_balancing_predictions, no_balancing_probabilities = cross_validate_random_forest(
+    X_train_selected, y_train, "none")
+
+metric_rows = []
+for name, predictions, probabilities in [
+        ("RF + 18 sensors, no balancing", no_balancing_predictions, no_balancing_probabilities),
+        ("RF + 18 sensors + " + BALANCING_METHOD, best_predictions, best_probabilities)]:
+    row = full_evaluation(y_train, predictions, probabilities)
+    row["model"] = name
+    metric_rows.append(row)
+metrics_table = pd.DataFrame(metric_rows)
+metrics_table = metrics_table[["model", "TN", "FP", "FN", "TP", "accuracy", "recall", "specificity",
+                               "precision", "F1", "F2", "ROC_AUC", "cost_eur"]]
+print(metrics_table.to_string(index=False))
+# Build the file name first: "/" (join a folder and a name) is applied before
+# "+", so joining and adding text in one expression would fail.
+metrics_file_name = "block12_metrics_" + BALANCING_METHOD.lower() + ".csv"
+metrics_table.to_csv(TABLES_FOLDER / metrics_file_name, index=False)
+print("For comparison - always 'pass': accuracy", round(float((y_train == 0).mean()), 4),
+      "| recall 0 | cost EUR", format(int(COST_FALSE_NEGATIVE * (y_train == 1).sum()), ","))
+
+plot_confusion_matrix(y_train, best_predictions,
+                      "Random forest + 18 Boruta sensors + " + BALANCING_METHOD + " (5-fold CV, training set)",
+                      "block12_01_confusion_matrix_" + BALANCING_METHOD.lower() + ".png")
+plot_roc_curve(y_train, best_probabilities, best_predictions,
+               "ROC curve: random forest + 18 sensors + " + BALANCING_METHOD + " (5-fold CV, training set)",
+               "block12_02_roc_curve_" + BALANCING_METHOD.lower() + ".png")
+
+
+# ----- 12.2 The precision-recall trade-off (illustration only, no threshold chosen) -----
+print("\n--- 12.2 Precision-recall trade-off at other thresholds (illustration; D16 is decided in Phase 3) ---")
+# A wafer is called "fail" when its failure probability is above the threshold.
+# At 0.5 this is exactly what predict() does (more than half of the trees vote fail).
+threshold_rows = []
+for threshold in [0.5, 0.4, 0.3, 0.2]:
+    threshold_predictions = (best_probabilities > threshold).astype(int)
+    row = evaluate_predictions(y_train, threshold_predictions)
+    row["threshold"] = threshold
+    threshold_rows.append(row)
+threshold_table = pd.DataFrame(threshold_rows)
+threshold_table = threshold_table[["threshold", "TP", "FN", "FP", "recall", "precision", "cost_eur"]]
+print(threshold_table.to_string(index=False))
+threshold_table.to_csv(TABLES_FOLDER / "block12_threshold_illustration.csv", index=False)
+
+
+# ----- 12.3 Normality check (manual week 5, step 1) -----
+print("\n--- 12.3 Normality check ---")
+# A Box-Cox or Yeo-Johnson transformation is only needed if the model assumes
+# normally distributed inputs. A random forest does not (it only compares values
+# with thresholds), so no transformation is applied. For the record, the
+# skewness of the 18 selected sensors (0 = symmetric like a bell curve; skewness
+# does not change with min-max scaling):
+selected_skewness = X_train_selected.skew().round(3)
+selected_skewness.to_csv(TABLES_FOLDER / "block12_selected_sensor_skewness.csv", header=["skewness"],
+                         index_label="sensor")
+print("Selected sensors with |skewness| > 1 (clearly not bell-shaped):",
+      int((selected_skewness.abs() > 1).sum()), "of", len(selected_skewness))
+print("Skewness range:", selected_skewness.min(), "to", selected_skewness.max())
+print("Conclusion: random forest does not assume normality -> no Box-Cox / Yeo-Johnson.")
