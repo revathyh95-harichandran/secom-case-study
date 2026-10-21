@@ -1,0 +1,6 @@
+model,mean_extra_cost_per_fold,std_of_extra_cost,clearly_worse_than_final
+logistic_regression + ROSE,4680.0,3021.9,True
+random_forest + ROSE,5240.0,6383.4,False
+balanced_random_forest + none,4800.0,5558.8,False
+gradient_boosting + none,3080.0,3366.3,False
+easy_ensemble + none,0.0,0.0,False

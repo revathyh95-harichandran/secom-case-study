@@ -155,6 +155,8 @@ from imblearn.ensemble import BalancedRandomForestClassifier, EasyEnsembleClassi
 import time
 from sklearn.model_selection import GridSearchCV
 from sklearn.metrics import make_scorer, fbeta_score
+# Phase 3 import: precision-recall curves (Block 16).
+from sklearn.metrics import precision_recall_curve
 
 
 # %% Block 1: Settings
@@ -2618,3 +2620,347 @@ print("Mean average precision: fixed 18 sensors", round(float(fixed_precisions.m
       "| Boruta inside the folds", round(float(in_fold_precisions.mean()), 4),
       "| optimism of the fixed list", round(float(fixed_precisions.mean() - in_fold_precisions.mean()), 4))
 print("Boruta check finished in", round(time.perf_counter() - boruta_start_time), "s")
+
+
+# %% Block 16: Decision threshold by cost and sensitivity analysis (training set only)
+# A missed failure costs 25 times more than a false alarm, so the default rule
+# "fail if the probability is above 0.5" is not the cheapest. For each of the
+# five tuned pairs (Block 15), this block finds the threshold with the lowest
+# total cost on the cross-validated training probabilities (D16; never on the
+# test set, RULES_BOOK), chooses the final model by the lowest total cost
+# (professor's rule 11; DECISIONS.md, 21 Oct), shows whether the differences
+# are within the fold noise, checks how optimistic the threshold is, draws ROC and precision-recall
+# curves and repeats the choice for other cost assumptions (manual 14.3).
+# Manual Section 14. The test set is not used in this block.
+
+
+def cost_for_threshold(y_data, probabilities, threshold, cost_fp, cost_fn):
+    """
+    Total cost when every wafer with a failure probability above the threshold
+    is flagged as failed (the same "above" rule as threshold 0.5 before).
+
+    Input:  y_data (Series of true labels), probabilities (Series, same order),
+            threshold (float), cost_fp and cost_fn (euros per false positive and
+            per false negative)
+    Output: total cost (number), false positives (int), false negatives (int)
+    """
+    predictions = (probabilities > threshold).astype(int)
+    false_positives = int(((predictions == 1) & (y_data == 0)).sum())
+    false_negatives = int(((predictions == 0) & (y_data == 1)).sum())
+    total_cost = cost_fp * false_positives + cost_fn * false_negatives
+    return total_cost, false_positives, false_negatives
+
+
+def best_threshold(y_data, probabilities, cost_fp, cost_fn):
+    """
+    The threshold from THRESHOLDS with the lowest total cost. On a tie the
+    lowest threshold is kept, because a missed failure is the expensive error.
+
+    Input:  y_data (Series), probabilities (Series), cost_fp and cost_fn (euros)
+    Output: best threshold (float), its total cost (number)
+    """
+    best_value = None
+    best_cost = None
+    for threshold in THRESHOLDS:
+        cost, false_positives, false_negatives = cost_for_threshold(y_data, probabilities, threshold, cost_fp, cost_fn)
+        # Strictly cheaper only, so the first (lowest) threshold wins a tie.
+        if best_cost is None or cost < best_cost:
+            best_cost = cost
+            best_value = threshold
+    return best_value, best_cost
+
+
+def fold_costs_at_threshold(y_data, probabilities, threshold):
+    """
+    Cost in each of the five CV parts at one threshold (base costs), from the
+    out-of-fold probabilities.
+
+    Input:  y_data (Series), probabilities (Series, out-of-fold), threshold (float)
+    Output: array with the cost of each part
+    """
+    costs = []
+    for train_positions, validation_positions in cv_splitter.split(y_data, y_data):
+        cost, false_positives, false_negatives = cost_for_threshold(
+            y_data.iloc[validation_positions], probabilities.iloc[validation_positions],
+            threshold, COST_FALSE_POSITIVE, COST_FALSE_NEGATIVE)
+        costs.append(cost)
+    return np.array(costs)
+
+
+# ----- 16.1 Out-of-fold probabilities of the five tuned pairs -----
+print("\n--- 16.1 Tuned pairs: out-of-fold probabilities (same 5 folds) ---")
+# Thresholds 0.01, 0.02, ..., 0.99: np.arange(1, 100) gives 1 to 99, divided
+# by 100. A finer step would only fit the noise of 83 failed wafers.
+THRESHOLDS = np.round(np.arange(1, 100) / 100, 2)
+# Order from simplest to most complex model: the order of all tables and
+# figures, and the winner of an exact cost tie (DECISIONS.md, 21 Oct).
+SIMPLICITY_ORDER = ["logistic_regression", "random_forest", "balanced_random_forest",
+                    "gradient_boosting", "easy_ensemble"]
+# One colour per model, used in every Block 16 figure.
+CANDIDATE_COLORS = {"logistic_regression": "#2a78d6", "random_forest": "#eb6834",
+                    "balanced_random_forest": "#008300", "gradient_boosting": "#8e44ad",
+                    "easy_ensemble": "#52514e"}
+
+candidate_names = {}
+candidate_probabilities = {}
+for candidate in tuned_candidates:
+    family = candidate["family"]
+    name = family + " + " + candidate["balancing"]
+    candidate_names[family] = name
+    # The tuned model: the Block 14 model with the one setting from Block 15.
+    model = make_model(family, candidate["balancing"])
+    model.set_params(**{candidate["setting"]: candidate["value"]})
+    pipeline = build_pipeline(model, candidate["balancing"], n_neighbors=candidate["k"])
+    costs_per_fold, probabilities = cross_validate_pipeline(pipeline, outlier_versions[candidate["outlier"]], y_train)
+    candidate_probabilities[family] = probabilities
+    # Check: the same average precision per fold as in the Block 15 grid search.
+    precisions_per_fold, recalls_per_fold = fold_values(y_train, probabilities)
+    block15_key = (name, candidate["outlier"], candidate["k"], candidate["value"])
+    print("  " + name.ljust(32), "AP", round(float(precisions_per_fold.mean()), 4),
+          "| matches Block 15:", bool(np.allclose(precisions_per_fold, grid_fold_precisions[block15_key])),
+          "| probabilities from", round(float(probabilities.min()), 3), "to", round(float(probabilities.max()), 3))
+
+
+# ----- 16.2 Total cost against the threshold -----
+print("\n--- 16.2 Cost-optimal threshold per model (base costs EUR",
+      COST_FALSE_POSITIVE, "/", COST_FALSE_NEGATIVE, ") ---")
+curve_rows = []
+best_rows = []
+candidate_fold_costs = {}
+candidate_thresholds = {}
+for family in SIMPLICITY_ORDER:
+    name = candidate_names[family]
+    probabilities = candidate_probabilities[family]
+    # Cost at every threshold (the curve), then the cheapest one.
+    curve_costs = []
+    for threshold in THRESHOLDS:
+        cost, false_positives, false_negatives = cost_for_threshold(
+            y_train, probabilities, threshold, COST_FALSE_POSITIVE, COST_FALSE_NEGATIVE)
+        curve_costs.append(cost)
+        curve_rows.append({"model": name, "threshold": threshold, "FP": false_positives,
+                           "FN": false_negatives, "cost_eur": cost})
+    threshold, lowest_cost = best_threshold(y_train, probabilities, COST_FALSE_POSITIVE, COST_FALSE_NEGATIVE)
+    candidate_thresholds[family] = threshold
+    candidate_fold_costs[family] = fold_costs_at_threshold(y_train, probabilities, threshold)
+    # The "flat valley": all thresholds within 5 % of the lowest cost.
+    near_best = []
+    for position in range(len(THRESHOLDS)):
+        if curve_costs[position] <= 1.05 * lowest_cost:
+            near_best.append(THRESHOLDS[position])
+    result = full_evaluation(y_train, (probabilities > threshold).astype(int), probabilities)
+    cost_at_default, fp_at_default, fn_at_default = cost_for_threshold(
+        y_train, probabilities, 0.5, COST_FALSE_POSITIVE, COST_FALSE_NEGATIVE)
+    best_rows.append({"model": name, "family": family, "best_threshold": threshold,
+                      "cost_eur": result["cost_eur"], "TP": result["TP"], "FP": result["FP"],
+                      "FN": result["FN"], "recall": result["recall"],
+                      "specificity": result["specificity"], "precision": result["precision"],
+                      "F2": result["F2"], "ROC_AUC": result["ROC_AUC"],
+                      "within_5_percent_from": min(near_best), "within_5_percent_to": max(near_best),
+                      "cost_at_0.5": cost_at_default,
+                      "std_cost_per_fold": round(float(candidate_fold_costs[family].std(ddof=1)), 1)})
+cost_curves = pd.DataFrame(curve_rows)
+cost_curves.to_csv(TABLES_FOLDER / "block16_cost_by_threshold.csv", index=False)
+best_thresholds = pd.DataFrame(best_rows).sort_values("cost_eur", kind="stable")
+print(best_thresholds.drop(columns="family").to_string(index=False))
+best_thresholds.to_csv(TABLES_FOLDER / "block16_best_thresholds.csv", index=False)
+
+# Figure: one cost curve per model, its minimum marked, threshold 0.5 dashed.
+figure, axis = plt.subplots(figsize=(10, 6))
+for family in SIMPLICITY_ORDER:
+    name = candidate_names[family]
+    model_curve = cost_curves[cost_curves["model"] == name]
+    axis.plot(model_curve["threshold"], model_curve["cost_eur"] / 1000, color=CANDIDATE_COLORS[family],
+              linewidth=1.8, label=name + " (best " + str(candidate_thresholds[family]) + ")")
+    lowest_row = best_thresholds[best_thresholds["family"] == family].iloc[0]
+    axis.plot(lowest_row["best_threshold"], lowest_row["cost_eur"] / 1000, marker="o", markersize=8,
+              color=CANDIDATE_COLORS[family])
+axis.axvline(0.5, linestyle="--", color=COLOR_REFERENCE)
+axis.text(0.505, axis.get_ylim()[1] * 0.98, "default 0.5", color=COLOR_REFERENCE, va="top", fontsize=8)
+axis.set_xlabel("Decision threshold (wafer flagged as failed if its probability is above it)")
+axis.set_ylabel("Total cost (thousand EUR): 200 x FP + 5,000 x FN")
+axis.set_title("Total cost against the decision threshold (training set, cross-validated probabilities)")
+axis.legend(fontsize=8)
+axis.spines["top"].set_visible(False)
+axis.spines["right"].set_visible(False)
+save_figure(figure, "block16_01_cost_vs_threshold.png")
+
+
+# ----- 16.3 Final model: the lowest total cost (rule 11) -----
+print("\n--- 16.3 Final model choice: lowest total cost at its own threshold ---")
+# best_thresholds is sorted by cost with kind="stable" from a table built in
+# SIMPLICITY_ORDER, so on an exact tie the simpler model comes first.
+final_family = best_thresholds.iloc[0]["family"]
+# For information only (not used for the choice): is each model's extra cost
+# per fold larger than the fold-to-fold noise? A tie rule based on this test
+# chose the most expensive model in the first run, because with 83 failed
+# wafers the noise is large (DECISIONS.md, 21 Oct).
+choice_rows = []
+for family in SIMPLICITY_ORDER:
+    extra_per_fold = candidate_fold_costs[family] - candidate_fold_costs[final_family]
+    clearly_worse = float(extra_per_fold.mean()) > float(extra_per_fold.std(ddof=1))
+    if family == final_family:
+        clearly_worse = False
+    choice_rows.append({"model": candidate_names[family],
+                        "mean_extra_cost_per_fold": round(float(extra_per_fold.mean()), 1),
+                        "std_of_extra_cost": round(float(extra_per_fold.std(ddof=1)), 1),
+                        "clearly_worse_than_final": clearly_worse})
+choice_table = pd.DataFrame(choice_rows)
+print(choice_table.to_string(index=False))
+choice_table.to_csv(TABLES_FOLDER / "block16_final_choice.csv", index=False)
+print("Chosen (lowest cost):", candidate_names[final_family])
+
+final_probabilities = candidate_probabilities[final_family]
+final_threshold = candidate_thresholds[final_family]
+final_predictions = (final_probabilities > final_threshold).astype(int)
+plot_confusion_matrix(y_train, final_predictions,
+                      "Final model " + candidate_names[final_family] + ", threshold " + str(final_threshold)
+                      + "\n(training set, cross-validated)", "block16_04_confusion_matrix_final.png")
+
+
+# ----- 16.4 How optimistic is a threshold chosen on the same predictions? -----
+print("\n--- 16.4 Threshold check: learned on 4 folds, applied to the 5th ---")
+check_rows = []
+fold_number = 0
+for train_positions, validation_positions in cv_splitter.split(y_train, y_train):
+    fold_number = fold_number + 1
+    # The threshold is learned only from the other four parts' probabilities.
+    learned_threshold, learned_cost = best_threshold(y_train.iloc[train_positions],
+                                                     final_probabilities.iloc[train_positions],
+                                                     COST_FALSE_POSITIVE, COST_FALSE_NEGATIVE)
+    cost_learned, fp_learned, fn_learned = cost_for_threshold(
+        y_train.iloc[validation_positions], final_probabilities.iloc[validation_positions],
+        learned_threshold, COST_FALSE_POSITIVE, COST_FALSE_NEGATIVE)
+    cost_pooled, fp_pooled, fn_pooled = cost_for_threshold(
+        y_train.iloc[validation_positions], final_probabilities.iloc[validation_positions],
+        final_threshold, COST_FALSE_POSITIVE, COST_FALSE_NEGATIVE)
+    check_rows.append({"fold": fold_number, "threshold_from_other_folds": learned_threshold,
+                       "cost_with_that_threshold": cost_learned,
+                       "cost_with_pooled_threshold": cost_pooled})
+threshold_check = pd.DataFrame(check_rows)
+print(threshold_check.to_string(index=False))
+threshold_check.to_csv(TABLES_FOLDER / "block16_threshold_check.csv", index=False)
+print("Total: pooled threshold", int(threshold_check["cost_with_pooled_threshold"].sum()),
+      "EUR | threshold learned without the fold", int(threshold_check["cost_with_that_threshold"].sum()), "EUR")
+
+
+# ----- 16.5 ROC and precision-recall curves of the five tuned pairs -----
+# Each curve shows every possible threshold at once; the dot is the model's
+# cost-optimal threshold from 16.2.
+figure_roc, axis_roc = plt.subplots(figsize=(7, 7))
+figure_pr, axis_pr = plt.subplots(figsize=(7, 7))
+for family in SIMPLICITY_ORDER:
+    name = candidate_names[family]
+    probabilities = candidate_probabilities[family]
+    lowest_row = best_thresholds[best_thresholds["family"] == family].iloc[0]
+    false_positive_rate, true_positive_rate, roc_thresholds = roc_curve(y_train, probabilities)
+    axis_roc.plot(false_positive_rate, true_positive_rate, color=CANDIDATE_COLORS[family], linewidth=1.8,
+                  label=name + " (AUC " + str(round(float(roc_auc_score(y_train, probabilities)), 3)) + ")")
+    axis_roc.plot(1 - lowest_row["specificity"], lowest_row["recall"], marker="o", markersize=8,
+                  color=CANDIDATE_COLORS[family])
+    # precision_recall_curve returns precision and recall for every threshold.
+    precision_values, recall_values, pr_thresholds = precision_recall_curve(y_train, probabilities)
+    axis_pr.plot(recall_values, precision_values, color=CANDIDATE_COLORS[family], linewidth=1.8,
+                 label=name + " (AP " + str(round(float(average_precision_score(y_train, probabilities)), 3)) + ")")
+    axis_pr.plot(lowest_row["recall"], lowest_row["precision"], marker="o", markersize=8,
+                 color=CANDIDATE_COLORS[family])
+axis_roc.plot([0, 1], [0, 1], linestyle="--", color=COLOR_REFERENCE, label="random guess (AUC 0.5)")
+axis_roc.set_xlabel("False-positive rate (good wafers flagged)")
+axis_roc.set_ylabel("True-positive rate = recall (failed wafers caught)")
+axis_roc.set_title("ROC curves, tuned pairs (training set, cross-validated)\ndots: cost-optimal thresholds", fontsize=10)
+axis_roc.legend(loc="lower right", fontsize=8)
+axis_roc.spines["top"].set_visible(False)
+axis_roc.spines["right"].set_visible(False)
+save_figure(figure_roc, "block16_02_roc_curves.png")
+axis_pr.axhline(float(y_train.mean()), linestyle="--", color=COLOR_REFERENCE,
+                label="random guess = failure share (" + str(round(float(y_train.mean()), 3)) + ")")
+axis_pr.set_xlabel("Recall (failed wafers caught)")
+axis_pr.set_ylabel("Precision (flagged wafers that really failed)")
+axis_pr.set_title("Precision-recall curves, tuned pairs (training set, cross-validated)\n"
+                  "dots: cost-optimal thresholds", fontsize=10)
+axis_pr.legend(loc="upper right", fontsize=8)
+axis_pr.spines["top"].set_visible(False)
+axis_pr.spines["right"].set_visible(False)
+save_figure(figure_pr, "block16_03_precision_recall_curves.png")
+
+
+# ----- 16.6 Sensitivity analysis: other cost assumptions (manual 14.3) -----
+print("\n--- 16.6 Sensitivity analysis: best threshold and model under other costs ---")
+# Each cost changed by -50, -20, +20 and +50 % while the other stays fixed,
+# plus the manual's example of EUR 100 / 400. Only the probabilities from 16.1
+# are reused; no model is retrained.
+cost_scenarios = [("baseline", 200, 5000),
+                  ("FP -50 %", 100, 5000), ("FP -20 %", 160, 5000),
+                  ("FP +20 %", 240, 5000), ("FP +50 %", 300, 5000),
+                  ("FN -50 %", 200, 2500), ("FN -20 %", 200, 4000),
+                  ("FN +20 %", 200, 6000), ("FN +50 %", 200, 7500),
+                  ("manual example", 100, 400)]
+sensitivity_rows = []
+summary_rows = []
+for scenario_name, cost_fp, cost_fn in cost_scenarios:
+    scenario_costs = {}
+    for family in SIMPLICITY_ORDER:
+        probabilities = candidate_probabilities[family]
+        threshold, cost = best_threshold(y_train, probabilities, cost_fp, cost_fn)
+        cost_again, false_positives, false_negatives = cost_for_threshold(y_train, probabilities, threshold, cost_fp, cost_fn)
+        scenario_costs[family] = cost
+        row = {"scenario": scenario_name, "cost_FP": cost_fp, "cost_FN": cost_fn,
+               "ratio_FN_to_FP": round(cost_fn / cost_fp, 2), "model": candidate_names[family],
+               "best_threshold": threshold, "cost_eur": cost, "FP": false_positives,
+               "FN": false_negatives, "recall": round(1 - false_negatives / int(y_train.sum()), 4)}
+        sensitivity_rows.append(row)
+        if family == final_family:
+            final_model_row = row
+    # Cheapest model in this scenario (first in simplicity order on a tie), and
+    # the final model's rank: 1 + the number of models that are cheaper.
+    cheapest_in_scenario = SIMPLICITY_ORDER[0]
+    final_model_rank = 1
+    for family in SIMPLICITY_ORDER:
+        if scenario_costs[family] < scenario_costs[cheapest_in_scenario]:
+            cheapest_in_scenario = family
+        if scenario_costs[family] < scenario_costs[final_family]:
+            final_model_rank = final_model_rank + 1
+    summary_rows.append({"scenario": scenario_name, "ratio_FN_to_FP": round(cost_fn / cost_fp, 2),
+                         "cheapest_model": candidate_names[cheapest_in_scenario],
+                         "final_model_threshold": final_model_row["best_threshold"],
+                         "final_model_cost": final_model_row["cost_eur"],
+                         "final_model_recall": final_model_row["recall"],
+                         "final_model_rank": final_model_rank})
+sensitivity_table = pd.DataFrame(sensitivity_rows)
+sensitivity_table.to_csv(TABLES_FOLDER / "block16_sensitivity.csv", index=False)
+sensitivity_summary = pd.DataFrame(summary_rows)
+print(sensitivity_summary.to_string(index=False))
+sensitivity_summary.to_csv(TABLES_FOLDER / "block16_sensitivity_summary.csv", index=False)
+
+# Figure: best threshold against the cost ratio (log scale), one line per model.
+figure, axis = plt.subplots(figsize=(9, 5.5))
+for family in SIMPLICITY_ORDER:
+    model_rows = sensitivity_table[sensitivity_table["model"] == candidate_names[family]]
+    model_rows = model_rows.sort_values("ratio_FN_to_FP")
+    axis.plot(model_rows["ratio_FN_to_FP"], model_rows["best_threshold"], marker="o",
+              color=CANDIDATE_COLORS[family], label=candidate_names[family])
+axis.axvline(COST_FALSE_NEGATIVE / COST_FALSE_POSITIVE, linestyle="--", color=COLOR_REFERENCE)
+axis.text(COST_FALSE_NEGATIVE / COST_FALSE_POSITIVE * 1.03, 0.97, "base 5,000 / 200 = 25",
+          color=COLOR_REFERENCE, fontsize=8, va="top")
+axis.set_xscale("log")
+# Plain numbers at the scenario ratios instead of the default "4 x 10^0" labels.
+axis.set_xticks([4, 12.5, 20, 25, 30, 37.5, 50])
+axis.set_xticklabels(["4", "12.5", "20", "25", "30", "37.5", "50"])
+axis.minorticks_off()
+axis.set_ylim(0, 1)
+axis.set_xlabel("Cost ratio: false negative / false positive (log scale)")
+axis.set_ylabel("Cost-optimal threshold")
+axis.set_title("Sensitivity analysis: how the best threshold moves with the cost ratio (training set)")
+axis.legend(fontsize=8)
+axis.spines["top"].set_visible(False)
+axis.spines["right"].set_visible(False)
+save_figure(figure, "block16_05_sensitivity.png")
+
+
+# ----- 16.7 The final decisions, stored for Block 17 -----
+print("\n--- 16.7 Final decisions (fixed from here on; Block 17 only applies them) ---")
+for candidate in tuned_candidates:
+    if candidate["family"] == final_family:
+        final_choice = dict(candidate)
+final_choice["threshold"] = final_threshold
+for key in final_choice:
+    print("  " + key.ljust(10), final_choice[key])

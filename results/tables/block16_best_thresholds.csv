@@ -1,0 +1,6 @@
+model,family,best_threshold,cost_eur,TP,FP,FN,recall,specificity,precision,F2,ROC_AUC,within_5_percent_from,within_5_percent_to,cost_at_0.5,std_cost_per_fold
+easy_ensemble + none,easy_ensemble,0.49,156800,68,409,15,0.8193,0.6504,0.1426,0.4204,0.7898,0.48,0.49,187800,6512.1
+gradient_boosting + none,gradient_boosting,0.01,172200,76,686,7,0.9157,0.4137,0.0997,0.3473,0.7692,0.01,0.01,381200,7737.4
+logistic_regression + ROSE,logistic_regression,0.46,180200,73,651,10,0.8795,0.4436,0.1008,0.3456,0.7443,0.45,0.47,216200,6632.3
+balanced_random_forest + none,balanced_random_forest,0.36,180800,69,554,14,0.8313,0.5265,0.1108,0.3613,0.7458,0.33,0.44,243000,6626.3
+random_forest + ROSE,random_forest,0.24,183000,64,440,19,0.7711,0.6239,0.127,0.3828,0.7249,0.22,0.25,282600,6631.7

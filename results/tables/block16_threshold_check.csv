@@ -1,0 +1,6 @@
+fold,threshold_from_other_folds,cost_with_that_threshold,cost_with_pooled_threshold
+1,0.49,35200,35200
+2,0.49,41000,41000
+3,0.49,26600,26600
+4,0.49,26200,26200
+5,0.49,27800,27800

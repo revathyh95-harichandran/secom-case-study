@@ -1,0 +1,51 @@
+scenario,cost_FP,cost_FN,ratio_FN_to_FP,model,best_threshold,cost_eur,FP,FN,recall
+baseline,200,5000,25.0,logistic_regression + ROSE,0.46,180200,651,10,0.8795
+baseline,200,5000,25.0,random_forest + ROSE,0.24,183000,440,19,0.7711
+baseline,200,5000,25.0,balanced_random_forest + none,0.36,180800,554,14,0.8313
+baseline,200,5000,25.0,gradient_boosting + none,0.01,172200,686,7,0.9157
+baseline,200,5000,25.0,easy_ensemble + none,0.49,156800,409,15,0.8193
+FP -50 %,100,5000,50.0,logistic_regression + ROSE,0.45,105900,759,6,0.9277
+FP -50 %,100,5000,50.0,random_forest + ROSE,0.02,113500,1085,1,0.988
+FP -50 %,100,5000,50.0,balanced_random_forest + none,0.17,109800,1098,0,1.0
+FP -50 %,100,5000,50.0,gradient_boosting + none,0.01,103600,686,7,0.9157
+FP -50 %,100,5000,50.0,easy_ensemble + none,0.43,95200,852,2,0.9759
+FP -20 %,160,5000,31.25,logistic_regression + ROSE,0.45,151440,759,6,0.9277
+FP -20 %,160,5000,31.25,random_forest + ROSE,0.24,165400,440,19,0.7711
+FP -20 %,160,5000,31.25,balanced_random_forest + none,0.35,158600,585,13,0.8434
+FP -20 %,160,5000,31.25,gradient_boosting + none,0.01,144760,686,7,0.9157
+FP -20 %,160,5000,31.25,easy_ensemble + none,0.45,139240,714,5,0.9398
+FP +20 %,240,5000,20.83,logistic_regression + ROSE,0.47,205800,545,15,0.8193
+FP +20 %,240,5000,20.83,random_forest + ROSE,0.24,200600,440,19,0.7711
+FP +20 %,240,5000,20.83,balanced_random_forest + none,0.43,198800,370,22,0.7349
+FP +20 %,240,5000,20.83,gradient_boosting + none,0.01,199640,686,7,0.9157
+FP +20 %,240,5000,20.83,easy_ensemble + none,0.49,173160,409,15,0.8193
+FP +50 %,300,5000,16.67,logistic_regression + ROSE,0.47,238500,545,15,0.8193
+FP +50 %,300,5000,16.67,random_forest + ROSE,0.24,227000,440,19,0.7711
+FP +50 %,300,5000,16.67,balanced_random_forest + none,0.43,221000,370,22,0.7349
+FP +50 %,300,5000,16.67,gradient_boosting + none,0.02,231100,437,20,0.759
+FP +50 %,300,5000,16.67,easy_ensemble + none,0.49,197700,409,15,0.8193
+FN -50 %,200,2500,12.5,logistic_regression + ROSE,0.5,136200,281,32,0.6145
+FN -50 %,200,2500,12.5,random_forest + ROSE,0.24,135500,440,19,0.7711
+FN -50 %,200,2500,12.5,balanced_random_forest + none,0.43,129000,370,22,0.7349
+FN -50 %,200,2500,12.5,gradient_boosting + none,0.03,131200,306,28,0.6627
+FN -50 %,200,2500,12.5,easy_ensemble + none,0.49,119300,409,15,0.8193
+FN -20 %,200,4000,20.0,logistic_regression + ROSE,0.47,169000,545,15,0.8193
+FN -20 %,200,4000,20.0,random_forest + ROSE,0.24,164000,440,19,0.7711
+FN -20 %,200,4000,20.0,balanced_random_forest + none,0.43,162000,370,22,0.7349
+FN -20 %,200,4000,20.0,gradient_boosting + none,0.01,165200,686,7,0.9157
+FN -20 %,200,4000,20.0,easy_ensemble + none,0.49,141800,409,15,0.8193
+FN +20 %,200,6000,30.0,logistic_regression + ROSE,0.45,187800,759,6,0.9277
+FN +20 %,200,6000,30.0,random_forest + ROSE,0.24,202000,440,19,0.7711
+FN +20 %,200,6000,30.0,balanced_random_forest + none,0.36,194800,554,14,0.8313
+FN +20 %,200,6000,30.0,gradient_boosting + none,0.01,179200,686,7,0.9157
+FN +20 %,200,6000,30.0,easy_ensemble + none,0.49,171800,409,15,0.8193
+FN +50 %,200,7500,37.5,logistic_regression + ROSE,0.45,196800,759,6,0.9277
+FN +50 %,200,7500,37.5,random_forest + ROSE,0.02,224500,1085,1,0.988
+FN +50 %,200,7500,37.5,balanced_random_forest + none,0.35,214500,585,13,0.8434
+FN +50 %,200,7500,37.5,gradient_boosting + none,0.01,189700,686,7,0.9157
+FN +50 %,200,7500,37.5,easy_ensemble + none,0.45,180300,714,5,0.9398
+manual example,100,400,4.0,logistic_regression + ROSE,0.59,30800,28,70,0.1566
+manual example,100,400,4.0,random_forest + ROSE,0.69,30000,28,68,0.1807
+manual example,100,400,4.0,balanced_random_forest + none,0.75,29800,14,71,0.1446
+manual example,100,400,4.0,gradient_boosting + none,0.19,28000,48,58,0.3012
+manual example,100,400,4.0,easy_ensemble + none,0.57,28600,62,56,0.3253
