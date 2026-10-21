@@ -2703,6 +2703,7 @@ CANDIDATE_COLORS = {"logistic_regression": "#2a78d6", "random_forest": "#eb6834"
 
 candidate_names = {}
 candidate_probabilities = {}
+candidate_average_precisions = {}
 for candidate in tuned_candidates:
     family = candidate["family"]
     name = family + " + " + candidate["balancing"]
@@ -2715,6 +2716,7 @@ for candidate in tuned_candidates:
     candidate_probabilities[family] = probabilities
     # Check: the same average precision per fold as in the Block 15 grid search.
     precisions_per_fold, recalls_per_fold = fold_values(y_train, probabilities)
+    candidate_average_precisions[family] = float(precisions_per_fold.mean())
     block15_key = (name, candidate["outlier"], candidate["k"], candidate["value"])
     print("  " + name.ljust(32), "AP", round(float(precisions_per_fold.mean()), 4),
           "| matches Block 15:", bool(np.allclose(precisions_per_fold, grid_fold_precisions[block15_key])),
@@ -2964,3 +2966,354 @@ for candidate in tuned_candidates:
 final_choice["threshold"] = final_threshold
 for key in final_choice:
     print("  " + key.ljust(10), final_choice[key])
+
+
+# ----- 16.8 Decision figures for the presentation -----
+# Seven figures that explain the final choice step by step (why a threshold by
+# cost, why EasyEnsemble, why 0.49, how robust, what it means for inspection,
+# how the selection narrowed down). They only reuse the training-set results of
+# Blocks 14 to 16 (cross-validated); nothing is refitted and the test set is
+# not used. The final model is blue, all other models grey.
+print("\n--- 16.8 Decision figures for the presentation ---")
+FINAL_COLOR = COLOR_MAIN
+OTHER_COLOR = "#b0b0b0"
+COLOR_MISSED = COLOR_FAIL
+COLOR_ALARMS = "#9ecae1"
+# Readable model names for slides instead of the code names.
+FAMILY_LABELS = {"logistic_regression": "Logistic regression", "random_forest": "Random forest",
+                 "balanced_random_forest": "Balanced random forest",
+                 "gradient_boosting": "Gradient boosting", "easy_ensemble": "EasyEnsemble"}
+# Readable names of the tuned model settings (Block 15).
+SETTING_LABELS = {"n_estimators": "sub-models:", "min_samples_leaf": "leaf size",
+                  "learning_rate": "learning rate", "C": "C ="}
+
+
+def display_name(family):
+    """
+    Readable name of a tuned model for the figures, for example
+    "Random forest + ROSE" or "EasyEnsemble" (no "+ none").
+
+    Input:  family (str, a key of candidate_names)
+    Output: the name (str)
+    """
+    balancing = candidate_names[family].split(" + ")[1]
+    if balancing == "none":
+        return FAMILY_LABELS[family]
+    return FAMILY_LABELS[family] + " + " + balancing
+
+
+def plain_number(value):
+    """
+    A number as short text: 30.0 becomes "30", 12.5 stays "12.5".
+
+    Input:  value (int or float)
+    Output: str
+    """
+    if float(value) == int(value):
+        return str(int(value))
+    return str(value)
+
+
+def presentation_axis(axis, title, x_label, y_label):
+    """
+    Give an axis the common style of the decision figures: a title that states
+    the message, readable labels for slides, no top and right frame lines.
+
+    Input:  axis (matplotlib Axes), title, x_label, y_label (str)
+    Output: none (the axis is changed in place)
+    """
+    axis.set_title(title, fontsize=12)
+    axis.set_xlabel(x_label, fontsize=11)
+    axis.set_ylabel(y_label, fontsize=11)
+    axis.tick_params(labelsize=10)
+    axis.spines["top"].set_visible(False)
+    axis.spines["right"].set_visible(False)
+
+
+number_of_wafers = len(y_train)
+number_of_failures = int(y_train.sum())
+number_of_passes = number_of_wafers - number_of_failures
+final_label = display_name(final_family)
+print("Final model mean average precision (6 decimals):", round(candidate_average_precisions[final_family], 6))
+# The final model's rows of the cost-by-threshold table (16.2), with the number
+# of failures caught and the share of wafers inspected (flagged) per threshold.
+final_curve = cost_curves[cost_curves["model"] == candidate_names[final_family]].copy()
+final_curve["caught"] = number_of_failures - final_curve["FN"]
+final_curve["inspected_percent"] = (final_curve["FP"] + final_curve["caught"]) / number_of_wafers * 100
+final_curve["caught_percent"] = final_curve["caught"] / number_of_failures * 100
+# np.isclose avoids problems with tiny rounding differences in decimal thresholds.
+final_row = final_curve[np.isclose(final_curve["threshold"], final_threshold)].iloc[0]
+default_row = final_curve[np.isclose(final_curve["threshold"], 0.5)].iloc[0]
+
+
+# Figure 1: where the money goes, from "no screening" to the final threshold.
+strategies = [("Flag no wafer", 0, number_of_failures),
+              ("Flag every wafer", number_of_passes, 0),
+              (final_label + "\nat 0.5", int(default_row["FP"]), int(default_row["FN"])),
+              (final_label + "\nat " + str(final_threshold), int(final_row["FP"]), int(final_row["FN"]))]
+figure, axis = plt.subplots(figsize=(10, 6))
+strategy_labels = []
+for position in range(len(strategies)):
+    label, false_alarms, missed = strategies[position]
+    strategy_labels.append(label)
+    missed_cost = missed * COST_FALSE_NEGATIVE / 1000
+    alarm_cost = false_alarms * COST_FALSE_POSITIVE / 1000
+    # Stacked bar: missed failures at the bottom, false alarms on top; the
+    # legend label is given only once (first bar).
+    missed_label = None
+    alarm_label = None
+    if position == 0:
+        missed_label = "missed failures (EUR 5,000 each)"
+        alarm_label = "false alarms (EUR 200 each)"
+    axis.bar(position, missed_cost, color=COLOR_MISSED, width=0.6, label=missed_label)
+    axis.bar(position, alarm_cost, bottom=missed_cost, color=COLOR_ALARMS, width=0.6, label=alarm_label)
+    axis.text(position, missed_cost + alarm_cost + 6, "EUR " + format(int((missed_cost + alarm_cost) * 1000), ","),
+              ha="center", fontsize=11, fontweight="bold")
+    axis.text(position, -32, str(number_of_failures - missed) + " of " + str(number_of_failures) + " caught\n"
+              + format(false_alarms, ",") + " false alarms", ha="center", va="top", fontsize=9)
+axis.set_xticks(range(len(strategies)))
+axis.set_xticklabels(strategy_labels, fontsize=10)
+axis.set_ylim(-75, 470)
+axis.axhline(0, color="#595959", linewidth=0.8)
+axis.legend(fontsize=9, loc="upper right")
+saving_vs_default = int(default_row["cost_eur"] - final_row["cost_eur"])
+presentation_axis(axis, "Setting the threshold by cost saves EUR " + format(saving_vs_default, ",")
+                  + " against the default 0.5\n(training set, cross-validated, " + format(number_of_wafers, ",")
+                  + " wafers)", "", "Total cost (thousand EUR)")
+save_figure(figure, "block16_06_decision_cost_breakdown.png")
+
+# Figure 2: the five tuned models on cost, average precision and ROC-AUC.
+# Rows from the most expensive (bottom) to the cheapest (top).
+comparison = best_thresholds.sort_values("cost_eur", ascending=False, kind="stable")
+row_labels = []
+bar_colors = []
+cost_values = []
+precision_values = []
+auc_values = []
+for row_number in range(len(comparison)):
+    family = comparison.iloc[row_number]["family"]
+    row_labels.append(display_name(family))
+    bar_colors.append(FINAL_COLOR if family == final_family else OTHER_COLOR)
+    cost_values.append(float(comparison.iloc[row_number]["cost_eur"]) / 1000)
+    # Mean average precision over the 5 folds (the selection score), unrounded.
+    precision_values.append(candidate_average_precisions[family])
+    auc_values.append(float(comparison.iloc[row_number]["ROC_AUC"]))
+figure, axes = plt.subplots(1, 3, figsize=(15, 5.2), sharey=True)
+panels = [(cost_values, "Total cost at own best threshold t\n(thousand EUR, lower is better)", None),
+          (precision_values, "Average precision, mean of 5 folds\n(higher is better)", float(y_train.mean())),
+          (auc_values, "ROC-AUC\n(higher is better)", 0.5)]
+top_position = len(comparison) - 0.35
+for panel in range(3):
+    values, label, guess_line = panels[panel]
+    axes[panel].barh(range(len(values)), values, color=bar_colors)
+    for row in range(len(values)):
+        # Panel 0 shows euros and the model's threshold t; the others 3 decimals.
+        if panel == 0:
+            text = ("EUR " + format(int(round(values[row] * 1000)), ",") + " (t = "
+                    + str(comparison.iloc[row]["best_threshold"]) + ")")
+        else:
+            text = format(values[row], ".3f")
+        axes[panel].text(values[row], row, " " + text, va="center", fontsize=9)
+    # The random-guess line, labelled above the top bar so nothing overlaps.
+    if guess_line is not None:
+        axes[panel].axvline(guess_line, linestyle="--", color=COLOR_REFERENCE)
+        axes[panel].text(guess_line, top_position, " random guess", color=COLOR_REFERENCE, fontsize=8)
+    axes[panel].set_xlim(0, max(values) * 1.5)
+    axes[panel].set_ylim(-0.6, len(values) - 0.1)
+    presentation_axis(axes[panel], "", label, "")
+axes[0].set_yticks(range(len(comparison)))
+axes[0].set_yticklabels(row_labels, fontsize=10)
+clearly_worse_families = []
+for row_number in range(len(choice_table)):
+    if choice_table.iloc[row_number]["clearly_worse_than_final"]:
+        for family in SIMPLICITY_ORDER:
+            if candidate_names[family] == choice_table.iloc[row_number]["model"]:
+                clearly_worse_families.append(display_name(family))
+figure.suptitle(final_label + " is best on all three measures (training set, cross-validated)", fontsize=13)
+figure.text(0.5, -0.1, "Note: with 83 failed wafers the fold-to-fold noise is large; only "
+            + " and ".join(clearly_worse_families) + " is more expensive than " + final_label
+            + " beyond that noise.", ha="center", fontsize=9, color=COLOR_REFERENCE)
+save_figure(figure, "block16_07_decision_model_comparison.png")
+
+# Figure 3: failures caught against false alarms - who catches more at equal alarms?
+alarm_budget = int(final_row["FP"])
+figure, axis = plt.subplots(figsize=(10, 6.5))
+caught_at_budget = {}
+for family in SIMPLICITY_ORDER:
+    model_curve = cost_curves[cost_curves["model"] == candidate_names[family]].sort_values("FP")
+    caught = number_of_failures - model_curve["FN"]
+    is_final = family == final_family
+    axis.step(model_curve["FP"], caught, where="post", color=FINAL_COLOR if is_final else OTHER_COLOR,
+              linewidth=3 if is_final else 1.5, zorder=3 if is_final else 2)
+    # Failures caught with at most the final model's number of false alarms,
+    # marked as a dot on the dashed line.
+    within_budget = model_curve[model_curve["FP"] <= alarm_budget]
+    caught_at_budget[family] = int(number_of_failures - within_budget["FN"].min())
+    axis.plot(alarm_budget, caught_at_budget[family], marker="o", markersize=8 if is_final else 6,
+              color=FINAL_COLOR if is_final else "#7f7f7f", zorder=4)
+axis.axvline(alarm_budget, linestyle="--", color=COLOR_REFERENCE)
+# A small list in the empty lower-right corner, highest first; sort(reverse=True)
+# orders the (caught, family) pairs by the number caught.
+label_rows = []
+for family in SIMPLICITY_ORDER:
+    label_rows.append((caught_at_budget[family], family))
+label_rows.sort(reverse=True)
+axis.text(0.55, 0.40, "Failures caught with " + str(alarm_budget) + " false alarms:", transform=axis.transAxes,
+          fontsize=10, fontweight="bold")
+for position in range(len(label_rows)):
+    caught, family = label_rows[position]
+    is_final = family == final_family
+    axis.text(0.57, 0.34 - position * 0.055, str(caught) + "   " + display_name(family), transform=axis.transAxes,
+              fontsize=10, color=FINAL_COLOR if is_final else "#595959",
+              fontweight="bold" if is_final else "normal")
+second_best = label_rows[1][0]
+axis.set_xlim(0, number_of_passes)
+axis.set_ylim(0, number_of_failures + 5)
+presentation_axis(axis, "With " + str(alarm_budget) + " false alarms, " + final_label + " catches "
+                  + str(caught_at_budget[final_family]) + " failures; the next best catches " + str(second_best)
+                  + "\n(training set, cross-validated; each line runs through thresholds 0.99 to 0.01)",
+                  "False alarms (good wafers flagged, of " + format(number_of_passes, ",") + ")",
+                  "Failures caught (of " + str(number_of_failures) + ")")
+save_figure(figure, "block16_08_decision_same_alarms.png")
+
+# Figure 4: why 0.49 - the two kinds of cost and their sum around the minimum.
+zoom = final_curve[(final_curve["threshold"] >= 0.40) & (final_curve["threshold"] <= 0.60)]
+figure, axis = plt.subplots(figsize=(10, 6))
+axis.plot(zoom["threshold"], zoom["FP"] * COST_FALSE_POSITIVE / 1000, color=COLOR_ALARMS, linewidth=2.5,
+          label="cost of false alarms")
+axis.plot(zoom["threshold"], zoom["FN"] * COST_FALSE_NEGATIVE / 1000, color=COLOR_MISSED, linewidth=2.5,
+          label="cost of missed failures")
+axis.plot(zoom["threshold"], zoom["cost_eur"] / 1000, color=FINAL_COLOR, linewidth=3.5, label="total cost")
+axis.plot(final_threshold, final_row["cost_eur"] / 1000, marker="o", markersize=11, color=FINAL_COLOR)
+axis.annotate("lowest total cost: " + str(final_threshold) + "\nEUR " + format(int(final_row["cost_eur"]), ",")
+              + ", " + str(int(final_row["caught"])) + " of " + str(number_of_failures) + " caught",
+              xy=(final_threshold, final_row["cost_eur"] / 1000), xytext=(final_threshold - 0.085, 60),
+              fontsize=10, arrowprops={"arrowstyle": "->", "color": FINAL_COLOR})
+axis.axvline(0.5, linestyle="--", color=COLOR_REFERENCE)
+axis.text(0.502, 395, "default 0.5:\nEUR " + format(int(default_row["cost_eur"]), ","), fontsize=9, color=COLOR_REFERENCE)
+# Share of wafers inspected at a few thresholds, written above the curves.
+for threshold in [0.42, 0.45, final_threshold, 0.52, 0.55, 0.58]:
+    row = zoom[np.isclose(zoom["threshold"], threshold)]
+    if len(row) > 0:
+        axis.text(threshold, 440, str(int(round(float(row["inspected_percent"].iloc[0])))) + " %",
+                  ha="center", fontsize=9, color="#595959")
+axis.text(0.40, 462, "wafers inspected:", fontsize=9, color="#595959")
+axis.set_ylim(0, 480)
+axis.legend(fontsize=9, loc="center left")
+presentation_axis(axis, "At " + str(final_threshold) + " the total cost is lowest: below it false alarms grow,"
+                  " above it missed failures grow\n(" + final_label + ", training set, cross-validated)",
+                  "Decision threshold", "Cost (thousand EUR)")
+save_figure(figure, "block16_09_decision_why_threshold.png")
+
+# Figure 5: is the threshold stable? (a) across folds, (b) across cost ratios.
+final_sensitivity = sensitivity_table[sensitivity_table["model"] == candidate_names[final_family]]
+final_sensitivity = final_sensitivity.sort_values("ratio_FN_to_FP")
+same_threshold = final_sensitivity[np.isclose(final_sensitivity["best_threshold"], final_threshold)]
+lowest_ratio = plain_number(same_threshold["ratio_FN_to_FP"].min())
+highest_ratio = plain_number(same_threshold["ratio_FN_to_FP"].max())
+# wspace=0.9 leaves room between the panels for the scenario names of panel (b).
+figure, axes = plt.subplots(1, 2, figsize=(16, 6), gridspec_kw={"wspace": 0.9})
+axes[0].plot(threshold_check["fold"], threshold_check["threshold_from_other_folds"], marker="o",
+             markersize=11, linestyle="none", color=FINAL_COLOR)
+axes[0].axhline(final_threshold, linestyle="--", color=COLOR_REFERENCE)
+axes[0].set_ylim(0.3, 0.7)
+axes[0].set_xticks(list(threshold_check["fold"]))
+presentation_axis(axes[0], "(a) Threshold learned without each fold:\n" + str(final_threshold)
+                  + " in every fold", "Fold left out", "Cost-optimal threshold")
+# Panel (b): one row per cost scenario (smallest cost ratio at the top), a dot
+# at its best threshold; blue if it is the final threshold, grey if not. Only
+# dots are drawn, because the scenarios between the tested ratios were not tried.
+for row_number in range(len(final_sensitivity)):
+    scenario = final_sensitivity.iloc[row_number]
+    # Readable scenario name, for example "Missed-failure cost +20 %".
+    if scenario["scenario"] == "baseline":
+        scenario_text = "Our costs: EUR 200 / 5,000"
+    elif scenario["scenario"] == "manual example":
+        scenario_text = "Manual example: EUR 100 / 400"
+    elif scenario["scenario"].startswith("FP"):
+        scenario_text = "False-alarm cost " + scenario["scenario"][3:]
+    else:
+        scenario_text = "Missed-failure cost " + scenario["scenario"][3:]
+    scenario_text = scenario_text + "  (ratio " + plain_number(round(float(scenario["ratio_FN_to_FP"]), 2)) + ")"
+    row_position = len(final_sensitivity) - 1 - row_number
+    is_final_threshold = bool(np.isclose(scenario["best_threshold"], final_threshold))
+    axes[1].plot(scenario["best_threshold"], row_position, marker="o", markersize=10,
+                 color=FINAL_COLOR if is_final_threshold else OTHER_COLOR)
+    # The value is written on the side away from the dashed line, so they never cross.
+    if scenario["best_threshold"] < final_threshold:
+        axes[1].text(scenario["best_threshold"] - 0.012, row_position, str(scenario["best_threshold"]),
+                     ha="right", va="center", fontsize=9, color="#595959")
+    else:
+        axes[1].text(scenario["best_threshold"] + 0.012, row_position, str(scenario["best_threshold"]),
+                     va="center", fontsize=9, color="#595959")
+    axes[1].text(0.295, row_position, scenario_text, ha="right", va="center", fontsize=9,
+                 fontweight="bold" if scenario["scenario"] == "baseline" else "normal")
+axes[1].axvline(final_threshold, linestyle="--", color=COLOR_REFERENCE)
+axes[1].set_xlim(0.3, 0.7)
+axes[1].set_ylim(-0.7, len(final_sensitivity) - 0.3)
+axes[1].set_yticks([])
+presentation_axis(axes[1], "(b) Best threshold under 10 cost assumptions:\n" + str(final_threshold) + " in "
+                  + str(len(same_threshold)) + " of " + str(len(final_sensitivity)) + " (every ratio from "
+                  + lowest_ratio + " to " + highest_ratio + ")", "Cost-optimal threshold", "")
+# y=1.05 places the main title above the two panel titles.
+figure.suptitle("The threshold " + str(final_threshold) + " is stable (" + final_label
+                + ", training set, cross-validated)", fontsize=13, y=1.05)
+save_figure(figure, "block16_10_decision_robustness.png")
+
+# Figure 6: what it means for the factory - share inspected against share caught.
+figure, axis = plt.subplots(figsize=(9, 7))
+workload = final_curve.sort_values("inspected_percent")
+axis.plot([0] + list(workload["inspected_percent"]) + [100], [0] + list(workload["caught_percent"]) + [100],
+          color=FINAL_COLOR, linewidth=3, label=final_label)
+axis.plot([0, 100], [0, 100], linestyle="--", color=COLOR_REFERENCE, label="random checking")
+axis.plot(final_row["inspected_percent"], final_row["caught_percent"], marker="o", markersize=12, color=FINAL_COLOR)
+axis.annotate("threshold " + str(final_threshold) + ": inspect " + str(int(round(final_row["inspected_percent"])))
+              + " %,\ncatch " + str(int(round(final_row["caught_percent"]))) + " % of failures",
+              xy=(final_row["inspected_percent"], final_row["caught_percent"]),
+              xytext=(final_row["inspected_percent"] + 8, final_row["caught_percent"] - 22),
+              fontsize=10, arrowprops={"arrowstyle": "->", "color": FINAL_COLOR})
+# Possible inspection capacities: the threshold that catches the most failures
+# while staying within the limit (on a tie, the cheaper one). Labels: the 20 %
+# one to the left of its line (above the curve), the 30 % one to the right
+# (below the curve), so they do not overlap.
+capacity_label_places = {20: (-0.8, 86, "right", "top"), 30: (0.8, 4, "left", "bottom")}
+for capacity in [20, 30]:
+    allowed = final_curve[final_curve["inspected_percent"] <= capacity]
+    best_allowed = allowed.sort_values(["caught", "cost_eur"], ascending=[False, True], kind="stable").iloc[0]
+    x_shift, y_place, alignment, vertical = capacity_label_places[capacity]
+    axis.axvline(capacity, linestyle=":", color="#7f7f7f")
+    axis.text(capacity + x_shift, y_place, "capacity " + str(capacity) + " %:\nthreshold "
+              + str(best_allowed["threshold"]) + ", catch\n" + str(int(best_allowed["caught"])) + " of "
+              + str(number_of_failures) + " (" + str(int(round(best_allowed["caught_percent"]))) + " %)",
+              ha=alignment, va=vertical, fontsize=9, color="#595959")
+axis.set_xlim(0, 100)
+axis.set_ylim(0, 102)
+axis.legend(fontsize=9, loc="lower right")
+presentation_axis(axis, "Inspecting " + str(int(round(final_row["inspected_percent"]))) + " % of wafers catches "
+                  + str(int(round(final_row["caught_percent"]))) + " % of failures\n(training set, cross-validated)",
+                  "Wafers inspected (%)", "Failed wafers caught (%)")
+save_figure(figure, "block16_11_decision_workload.png")
+
+# Figure 7: the selection funnel from Block 14 to the final model.
+funnel_steps = [str(len(combinations)) + " model x balancing combinations compared (Block 14)",
+                str(len(shortlist_pairs)) + " model families shortlisted by average precision (Block 14)",
+                str(len(grid_table)) + " tuned settings: outliers x k x one model setting (Block 15)",
+                str(len(best_thresholds)) + " tuned models, each at its cost-optimal threshold (Block 16)",
+                "1 final model: " + final_label + " (" + SETTING_LABELS[final_choice["setting"]] + " "
+                + str(final_choice["value"]) + "),\nthreshold " + str(final_threshold) + ", cost EUR " + format(int(final_row["cost_eur"]), ",")]
+funnel_widths = [1.0, 0.86, 0.72, 0.58, 0.58]
+funnel_colors = ["#e3e3e3", "#d0d0d0", "#bdbdbd", "#a9a9a9", FINAL_COLOR]
+figure, axis = plt.subplots(figsize=(11, 6))
+for step in range(len(funnel_steps)):
+    height_position = len(funnel_steps) - step
+    # A centred bar: it starts at -width/2, so all boxes share the same middle.
+    axis.barh(height_position, funnel_widths[step], left=-funnel_widths[step] / 2, height=0.8,
+              color=funnel_colors[step])
+    axis.text(0, height_position, funnel_steps[step], ha="center", va="center", fontsize=10,
+              color="white" if step == len(funnel_steps) - 1 else "#222222")
+axis.set_xlim(-0.55, 0.55)
+axis.axis("off")
+axis.set_title("How the final model was selected (training set only, 5-fold CV;\n"
+               "the " + str(len(X_test)) + " test wafers stay untouched until Block 17)", fontsize=12)
+save_figure(figure, "block16_12_decision_selection_funnel.png")
+
