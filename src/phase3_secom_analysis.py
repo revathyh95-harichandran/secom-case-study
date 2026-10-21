@@ -3317,3 +3317,213 @@ axis.set_title("How the final model was selected (training set only, 5-fold CV;\
                "the " + str(len(X_test)) + " test wafers stay untouched until Block 17)", fontsize=12)
 save_figure(figure, "block16_12_decision_selection_funnel.png")
 
+
+# %% Block 17: The one and only final test (test set, used once)
+# The honest estimate of how the final model performs on new wafers (manual
+# Section 15). Every decision was fixed and logged before this block (DECISIONS.md,
+# 21 Oct, Step 3.5). The final pipeline is refitted on all 1,253 training wafers;
+# the test set only receives the stored rules and transforms (no fitting), is
+# predicted at the chosen threshold and is scored once. Nothing may be changed
+# because of these numbers (professor's rules 1, 7 and 9).
+
+
+def wilson_interval(successes, total):
+    """
+    95 % confidence range for a share (for example recall = caught / failed),
+    by the Wilson score method, which stays between 0 and 1 and suits small
+    numbers such as 21 failed test wafers.
+
+    Input:  successes (int), total (int)
+    Output: lower and upper limit (floats between 0 and 1)
+    """
+    # z = 1.96: 95 % of a normal distribution lies within 1.96 standard deviations.
+    z = 1.96
+    share = successes / total
+    denominator = 1 + z * z / total
+    centre = (share + z * z / (2 * total)) / denominator
+    half_width = z * np.sqrt(share * (1 - share) / total + z * z / (4 * total * total)) / denominator
+    return centre - half_width, centre + half_width
+
+
+def count_changed_values(before, after):
+    """
+    Number of values that differ between two versions of the same table;
+    cells missing in both versions are not counted (NaN != NaN in pandas).
+
+    Input:  before, after (DataFrames with the same rows and columns)
+    Output: int
+    """
+    both_missing = before.isna() & after.isna()
+    return int(((after != before) & ~both_missing).sum().sum())
+
+
+# ----- 17.1 The decision sheet: everything fixed before the test -----
+print("\n--- 17.1 Final decisions (fixed before the test set is used) ---")
+decision_sheet = pd.DataFrame([
+    {"step": "Positive class", "decision": "failed wafer = 1, passed wafer = 0"},
+    {"step": "Split", "decision": "stratified 80/20, seed " + str(SEED) + ": " + str(len(y_train)) + " training ("
+     + str(int(y_train.sum())) + " failed) / " + str(len(y_test)) + " test wafers"},
+    {"step": "Column removal", "decision": str(len(columns_removed_in_block5)) + " columns removed, "
+     + str(X_train.shape[1]) + " -> " + str(X_train_reduced.shape[1])},
+    {"step": "Outliers", "decision": str(OUTLIER_SIGMA) + " sigma bounds from the training set, treatment "
+     + final_choice["outlier"]},
+    {"step": "Scaling", "decision": "min-max, learned on the training set"},
+    {"step": "Missing values", "decision": "kNN imputation, k = " + str(final_choice["k"])},
+    {"step": "Sensors", "decision": str(len(selected_features)) + " Boruta sensors"},
+    {"step": "Balancing", "decision": final_choice["balancing"] + " (outside the model)"},
+    {"step": "Model", "decision": display_name(final_family) + ", " + final_choice["setting"] + " = "
+     + str(final_choice["value"]) + ", seed " + str(SEED)},
+    {"step": "Threshold", "decision": "fail if probability > " + str(final_threshold)},
+    {"step": "Costs", "decision": "EUR " + str(COST_FALSE_POSITIVE) + " per false alarm, EUR "
+     + str(COST_FALSE_NEGATIVE) + " per missed failure"},
+    {"step": "Expected (cross-validated)", "decision": "cost EUR " + format(int(final_row["cost_eur"]), ",")
+     + " for " + str(len(y_train)) + " wafers"}])
+print(decision_sheet.to_string(index=False))
+decision_sheet.to_csv(TABLES_FOLDER / "block17_final_decisions.csv", index=False)
+
+
+# ----- 17.2 Apply the stored Phase 1 rules to the test set (no fitting) -----
+print("\n--- 17.2 Test set: stored rules applied ---")
+# The column list and the 3 sigma bounds were learned on the training set in
+# Blocks 5 and 7; here they are only applied.
+X_test_reduced = X_test.drop(columns=columns_removed_in_block5)
+if list(X_test_reduced.columns) != list(X_train_reduced.columns):
+    raise ValueError("The test set does not have the same columns as the training set.")
+X_test_treated = apply_outlier_treatment(final_choice["outlier"], X_test_reduced, lower_bounds, upper_bounds)
+print("Test set:", X_test.shape, "->", X_test_treated.shape, "| same columns as training: True")
+print("Test values capped with the training bounds:", count_changed_values(X_test_reduced, X_test_treated),
+      "| missing test values (filled by the imputer learned on training):", int(X_test_treated.isna().sum().sum()))
+save_processed(X_test_treated, y_test, "block17_test_treated.csv")
+
+
+# ----- 17.3 Refit the final pipeline on all training wafers -----
+print("\n--- 17.3 Final pipeline fitted on all", len(y_train), "training wafers ---")
+final_model = make_model(final_family, final_choice["balancing"])
+final_model.set_params(**{final_choice["setting"]: final_choice["value"]})
+final_pipeline = build_pipeline(final_model, final_choice["balancing"], n_neighbors=final_choice["k"])
+# fit() is called on training data only: scaler, imputer and model learn here.
+final_pipeline.fit(outlier_versions[final_choice["outlier"]], y_train)
+print("Fitted:", display_name(final_family), "|", final_choice["setting"], "=", final_choice["value"],
+      "| k =", final_choice["k"], "| threshold", final_threshold)
+
+
+# ----- 17.4 Predict the test set (transform only), then open the labels -----
+print("\n--- 17.4 FINAL TEST: predictions for the", len(y_test), "test wafers ---")
+# final_pipeline[:-1] runs every step except the model; on new data the scaler,
+# imputer and selector only transform (and the balancing step is skipped).
+test_ready = final_pipeline[:-1].transform(X_test_treated)
+print("Test data as the model sees it:", test_ready.shape, "(expected", len(y_test), "x",
+      len(selected_features), ")")
+test_probabilities = pd.Series(final_pipeline.predict_proba(X_test_treated)[:, 1], index=y_test.index)
+test_predictions = (test_probabilities > final_threshold).astype(int)
+# y_test is used here for the first time since Block 4.
+test_result = full_evaluation(y_test, test_predictions, test_probabilities)
+test_result["average_precision"] = round(float(average_precision_score(y_test, test_probabilities)), 4)
+print("FINAL TEST:", test_result)
+prediction_table = pd.DataFrame({"true_label": y_test, "failure_probability": test_probabilities.round(4),
+                                 "predicted_label": test_predictions})
+prediction_table.to_csv(TABLES_FOLDER / "block17_test_predictions.csv", index_label="wafer_id")
+
+
+# ----- 17.5 Cross-validation (training) vs. final test -----
+print("\n--- 17.5 Cross-validated training result vs. FINAL TEST ---")
+cv_result = full_evaluation(y_train, final_predictions, final_probabilities)
+cv_result["average_precision"] = round(float(average_precision_score(y_train, final_probabilities)), 4)
+test_failures = int(y_test.sum())
+test_passes = len(y_test) - test_failures
+comparison_rows = []
+for metric in ["TP", "FN", "FP", "TN", "accuracy", "recall", "specificity", "precision", "F1", "F2",
+               "ROC_AUC", "average_precision", "cost_eur"]:
+    comparison_rows.append({"metric": metric, "cross_validated_training": cv_result[metric],
+                            "final_test": test_result[metric]})
+# Cost per wafer makes the two sets (1,253 and 314 wafers) comparable.
+comparison_rows.append({"metric": "cost_per_wafer_eur",
+                        "cross_validated_training": round(cv_result["cost_eur"] / len(y_train), 1),
+                        "final_test": round(test_result["cost_eur"] / len(y_test), 1)})
+# Reference strategies on the test set (no model involved).
+comparison_rows.append({"metric": "test: flag no wafer (EUR)", "cross_validated_training": "",
+                        "final_test": test_failures * COST_FALSE_NEGATIVE})
+comparison_rows.append({"metric": "test: flag every wafer (EUR)", "cross_validated_training": "",
+                        "final_test": test_passes * COST_FALSE_POSITIVE})
+final_comparison = pd.DataFrame(comparison_rows)
+print(final_comparison.to_string(index=False))
+final_comparison.to_csv(TABLES_FOLDER / "block17_final_test_results.csv", index=False)
+
+# Figures: test confusion matrix; test ROC and precision-recall curves with the
+# 0.49 point; cross-validation vs. test on the main measures.
+plot_confusion_matrix(y_test, test_predictions, "FINAL TEST: " + display_name(final_family) + ", threshold "
+                      + str(final_threshold) + " (" + str(len(y_test)) + " test wafers)",
+                      "block17_01_confusion_matrix_test.png")
+figure, axes = plt.subplots(1, 2, figsize=(13, 6))
+false_positive_rate, true_positive_rate, roc_thresholds = roc_curve(y_test, test_probabilities)
+axes[0].plot(false_positive_rate, true_positive_rate, color=FINAL_COLOR, linewidth=2.5,
+             label="test (AUC " + format(test_result["ROC_AUC"], ".3f") + ")")
+axes[0].plot([0, 1], [0, 1], linestyle="--", color=COLOR_REFERENCE, label="random guess")
+axes[0].plot(1 - test_result["specificity"], test_result["recall"], marker="o", markersize=10, color=COLOR_FAIL,
+             linestyle="none", label="threshold " + str(final_threshold))
+axes[0].legend(fontsize=9, loc="lower right")
+presentation_axis(axes[0], "ROC curve, FINAL TEST", "False-positive rate", "Recall (failed wafers caught)")
+precision_values, recall_values, pr_thresholds = precision_recall_curve(y_test, test_probabilities)
+axes[1].plot(recall_values, precision_values, color=FINAL_COLOR, linewidth=2.5,
+             label="test (AP " + format(test_result["average_precision"], ".3f") + ")")
+axes[1].axhline(test_failures / len(y_test), linestyle="--", color=COLOR_REFERENCE,
+                label="random guess = failure share (" + format(test_failures / len(y_test), ".3f") + ")")
+axes[1].plot(test_result["recall"], test_result["precision"], marker="o", markersize=10, color=COLOR_FAIL,
+             linestyle="none", label="threshold " + str(final_threshold))
+axes[1].legend(fontsize=9, loc="upper right")
+presentation_axis(axes[1], "Precision-recall curve, FINAL TEST", "Recall", "Precision")
+save_figure(figure, "block17_02_roc_pr_test.png")
+
+measures = ["recall", "specificity", "precision", "ROC_AUC"]
+figure, axes = plt.subplots(1, 2, figsize=(13, 5.5), gridspec_kw={"width_ratios": [3, 1]})
+positions = np.arange(len(measures))
+cv_values = []
+test_values = []
+for measure in measures:
+    cv_values.append(cv_result[measure])
+    test_values.append(test_result[measure])
+axes[0].bar(positions - 0.2, cv_values, width=0.4, color=OTHER_COLOR, label="cross-validated (training)")
+axes[0].bar(positions + 0.2, test_values, width=0.4, color=FINAL_COLOR, label="FINAL TEST")
+for position in range(len(measures)):
+    axes[0].text(positions[position] - 0.2, cv_values[position] + 0.02, format(cv_values[position], ".2f"),
+                 ha="center", fontsize=9)
+    axes[0].text(positions[position] + 0.2, test_values[position] + 0.02, format(test_values[position], ".2f"),
+                 ha="center", fontsize=9)
+axes[0].set_xticks(positions)
+axes[0].set_xticklabels(measures)
+axes[0].set_ylim(0, 1.1)
+axes[0].legend(fontsize=9)
+presentation_axis(axes[0], "Main measures", "", "Value")
+cost_per_wafer = [cv_result["cost_eur"] / len(y_train), test_result["cost_eur"] / len(y_test)]
+axes[1].bar([0, 1], cost_per_wafer, color=[OTHER_COLOR, FINAL_COLOR])
+for position in range(2):
+    axes[1].text(position, cost_per_wafer[position] + 3, "EUR " + str(int(round(cost_per_wafer[position]))),
+                 ha="center", fontsize=9)
+axes[1].set_xticks([0, 1])
+axes[1].set_xticklabels(["CV", "test"])
+presentation_axis(axes[1], "Cost per wafer", "", "EUR")
+figure.suptitle(display_name(final_family) + " at threshold " + str(final_threshold)
+                + ": cross-validated training result vs. FINAL TEST", fontsize=13)
+save_figure(figure, "block17_03_cv_vs_test.png")
+
+
+# ----- 17.6 Uncertainty: how precise is the test recall with 21 failures? -----
+print("\n--- 17.6 95 % confidence range for recall (Wilson) ---")
+test_low, test_high = wilson_interval(test_result["TP"], test_failures)
+cv_low, cv_high = wilson_interval(cv_result["TP"], int(y_train.sum()))
+print("FINAL TEST recall", test_result["recall"], "(" + str(test_result["TP"]) + " of " + str(test_failures)
+      + "), 95 % range", round(test_low, 3), "to", round(test_high, 3))
+print("Cross-validated recall", cv_result["recall"], "(" + str(cv_result["TP"]) + " of " + str(int(y_train.sum()))
+      + "), 95 % range", round(cv_low, 3), "to", round(cv_high, 3))
+pd.DataFrame([{"set": "cross-validated training", "caught": cv_result["TP"], "failed": int(y_train.sum()),
+               "recall": cv_result["recall"], "low_95": round(cv_low, 3), "high_95": round(cv_high, 3)},
+              {"set": "final test", "caught": test_result["TP"], "failed": test_failures,
+               "recall": test_result["recall"], "low_95": round(test_low, 3), "high_95": round(test_high, 3)}]
+             ).to_csv(TABLES_FOLDER / "block17_recall_confidence.csv", index=False)
+
+
+# ----- 17.7 Lock -----
+print("\n--- 17.7 The test set has been used. Nothing may be changed because of these numbers. ---")
+print("Expected reasons for a gap (written before the run, DECISIONS.md): Boruta list chosen outside the folds,")
+print("best of many settings chosen (winner's curse), only", test_failures, "failed wafers in the test set.")
+

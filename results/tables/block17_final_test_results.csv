@@ -1,0 +1,17 @@
+metric,cross_validated_training,final_test
+TP,68,15.0
+FN,15,6.0
+FP,409,104.0
+TN,761,189.0
+accuracy,0.6616,0.6497
+recall,0.8193,0.7143
+specificity,0.6504,0.6451
+precision,0.1426,0.1261
+F1,0.2429,0.2143
+F2,0.4204,0.3695
+ROC_AUC,0.7898,0.7291
+average_precision,0.26,0.1995
+cost_eur,156800,50800.0
+cost_per_wafer_eur,125.1,161.8
+test: flag no wafer (EUR),,105000.0
+test: flag every wafer (EUR),,58600.0

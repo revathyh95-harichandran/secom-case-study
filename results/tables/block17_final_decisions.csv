@@ -1,0 +1,13 @@
+step,decision
+Positive class,"failed wafer = 1, passed wafer = 0"
+Split,"stratified 80/20, seed 42: 1253 training (83 failed) / 314 test wafers"
+Column removal,"140 columns removed, 590 -> 450"
+Outliers,"3 sigma bounds from the training set, treatment cap"
+Scaling,"min-max, learned on the training set"
+Missing values,"kNN imputation, k = 5"
+Sensors,18 Boruta sensors
+Balancing,none (outside the model)
+Model,"EasyEnsemble, n_estimators = 50, seed 42"
+Threshold,fail if probability > 0.49
+Costs,"EUR 200 per false alarm, EUR 5000 per missed failure"
+Expected (cross-validated),"cost EUR 156,800 for 1253 wafers"
