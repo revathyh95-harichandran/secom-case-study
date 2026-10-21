@@ -1,0 +1,34 @@
+item,value
+run date (data accessed),2026-10-21
+produced on,"local machine, Windows 11"
+Python,3.14.7
+"random seed (split, balancing, models, CV)",42
+"costs (false alarm / missed failure, EUR)",200 / 5000
+source secom.data,https://archive.ics.uci.edu/ml/machine-learning-databases/secom/secom.data
+size of secom.data (bytes),5389983
+SHA-256 of secom.data,20f0e7ee434f7dcbae0eea9ffff009a2b57f42d6b0dc9a5bd4f00782c0a3374c
+source secom_labels.data,https://archive.ics.uci.edu/ml/machine-learning-databases/secom/secom_labels.data
+size of secom_labels.data (bytes),40638
+SHA-256 of secom_labels.data,126884cf453705c9e61a903fe906f0665a3b45ce3639e621edc5c93c89627e03
+package Boruta,0.4.3
+package cloudpickle,3.1.2
+package contourpy,1.4.0
+package cycler,0.12.1
+package fonttools,4.67.0
+package imbalanced-learn,0.14.2
+package joblib,1.6.0
+package kiwisolver,1.5.1
+package matplotlib,3.11.2
+package narwhals,2.27.1
+package numpy,2.5.4
+package packaging,26.3
+package pandas,3.0.6
+package pillow,12.3.0
+package pyparsing,3.3.3
+package python-dateutil,2.9.0.post0
+package scikit-learn,1.9.1
+package scipy,1.18.1
+package six,1.17.0
+package sklearn-compat,0.1.6
+package threadpoolctl,3.7.0
+package tzdata,2026.5

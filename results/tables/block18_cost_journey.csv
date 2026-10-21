@@ -1,0 +1,9 @@
+stage,set,cost_eur,cost_per_wafer_eur
+"Random forest, 450 sensors (B9)",cross-validated training,415000,331.2
+"Random forest, 18 sensors (B10)",cross-validated training,400400,319.6
++ ROSE (B11),cross-validated training,310400,247.7
+Leak-proof pipeline (B13),cross-validated training,313600,250.3
+EasyEnsemble at 0.5 (B14),cross-validated training,191200,152.6
+"Tuned, at 0.5 (B15-16)",cross-validated training,187800,149.9
+"Tuned, at 0.49 (B16)",cross-validated training,156800,125.1
+FINAL TEST (B17),test,50800,161.8

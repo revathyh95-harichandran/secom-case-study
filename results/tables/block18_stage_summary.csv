@@ -1,0 +1,10 @@
+stage,before,after
+Data (Block 2),raw UCI files,"1567 wafers x 590 sensors, 104 failed"
+Split (Block 4),1567 wafers,1253 training (83 failed) / 314 test (21 failed)
+Column removal (Block 5),590 columns,"450 columns (116 zero variance, 0 duplicates, 24 > 60 % missing)"
+Outliers (Block 7),3 sigma bounds from the training set,4872 training values capped in 1008 of 1253 wafers; 1225 test values capped
+Missing values (Block 8),11211 training gaps,0 after kNN imputation (k = 5); mean imputation not used (rule 3)
+Scaling (Block 8),sensors in their own units,"min-max to 0..1, needed for kNN distances and logistic regression"
+Feature selection (Block 10),450 sensors,18 Boruta sensors (15 confirmed + 3 tentative)
+Balancing (final model),1170 passed : 83 failed,inside EasyEnsemble: each of 50 sub-models learns from 83 failed + 83 randomly chosen passed wafers
+Model and threshold (Blocks 14-16),22 combinations at threshold 0.5,"EasyEnsemble, threshold 0.49"

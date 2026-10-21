@@ -157,6 +157,11 @@ from sklearn.model_selection import GridSearchCV
 from sklearn.metrics import make_scorer, fbeta_score
 # Phase 3 import: precision-recall curves (Block 16).
 from sklearn.metrics import precision_recall_curve
+# Phase 3 imports: saving the final pipeline and the reproducibility record (Block 18).
+import joblib
+import hashlib
+import platform
+import datetime
 
 
 # %% Block 1: Settings
@@ -3526,4 +3531,158 @@ pd.DataFrame([{"set": "cross-validated training", "caught": cv_result["TP"], "fa
 print("\n--- 17.7 The test set has been used. Nothing may be changed because of these numbers. ---")
 print("Expected reasons for a gap (written before the run, DECISIONS.md): Boruta list chosen outside the folds,")
 print("best of many settings chosen (winner's curse), only", test_failures, "failed wafers in the test set.")
+
+
+# %% Block 18: Project summary, saved pipeline and reproducibility record
+# Closes the project (manual Sections 15.5, 16 and 17.2): a before -> after
+# summary of every stage and of the cost across the project, the final fitted
+# pipeline saved once to a file, and a record of the data and software versions
+# so that anyone can rerun the script and get the same numbers. Nothing is
+# refitted or changed; the test result from Block 17 is only reported.
+
+
+# ----- 18.1 What each stage changed (manual 16.1) -----
+print("\n--- 18.1 What each stage changed (before -> after) ---")
+# Outlier capping on the training set: changed values and wafers with at least one.
+both_missing_train = X_train_reduced.isna() & X_train_treated.isna()
+capped_mask = (X_train_treated != X_train_reduced) & ~both_missing_train
+capped_values = int(capped_mask.sum().sum())
+capped_wafers = int(capped_mask.any(axis=1).sum())
+failed_training = int(y_train.sum())
+stage_summary = pd.DataFrame([
+    {"stage": "Data (Block 2)", "before": "raw UCI files",
+     "after": str(X.shape[0]) + " wafers x " + str(X.shape[1]) + " sensors, " + str(int(y.sum())) + " failed"},
+    {"stage": "Split (Block 4)", "before": str(len(X)) + " wafers",
+     "after": str(len(y_train)) + " training (" + str(failed_training) + " failed) / " + str(len(y_test))
+     + " test (" + str(int(y_test.sum())) + " failed)"},
+    {"stage": "Column removal (Block 5)", "before": str(X_train.shape[1]) + " columns",
+     "after": str(X_train_reduced.shape[1]) + " columns (" + str(len(removed_zero_variance)) + " zero variance, "
+     + str(len(removed_duplicate_columns)) + " duplicates, " + str(len(removed_missing_columns))
+     + " > " + str(MISSING_THRESHOLD) + " % missing)"},
+    {"stage": "Outliers (Block 7)", "before": "3 sigma bounds from the training set",
+     "after": str(capped_values) + " training values capped in " + str(capped_wafers) + " of " + str(len(y_train))
+     + " wafers; " + str(count_changed_values(X_test_reduced, X_test_treated)) + " test values capped"},
+    {"stage": "Missing values (Block 8)", "before": str(int(X_train_treated.isna().sum().sum())) + " training gaps",
+     "after": str(int(X_train_imputed.isna().sum().sum())) + " after kNN imputation (k = " + str(KNN_NEIGHBORS)
+     + "); mean imputation not used (rule 3)"},
+    {"stage": "Scaling (Block 8)", "before": "sensors in their own units",
+     "after": "min-max to 0..1, needed for kNN distances and logistic regression"},
+    {"stage": "Feature selection (Block 10)", "before": str(X_train_reduced.shape[1]) + " sensors",
+     "after": str(len(selected_features)) + " Boruta sensors (" + str(len(confirmed_features)) + " confirmed + "
+     + str(len(tentative_features)) + " tentative)"},
+    {"stage": "Balancing (final model)", "before": str(len(y_train) - failed_training) + " passed : "
+     + str(failed_training) + " failed",
+     "after": "inside EasyEnsemble: each of " + str(final_choice["value"]) + " sub-models learns from "
+     + str(failed_training) + " failed + " + str(failed_training) + " randomly chosen passed wafers"},
+    {"stage": "Model and threshold (Blocks 14-16)", "before": "22 combinations at threshold 0.5",
+     "after": display_name(final_family) + ", threshold " + str(final_threshold)}])
+print(stage_summary.to_string(index=False))
+stage_summary.to_csv(TABLES_FOLDER / "block18_stage_summary.csv", index=False)
+
+
+# ----- 18.2 Cost across the project, per wafer -----
+print("\n--- 18.2 Cost across the project (cross-validated training, then the final test) ---")
+# Each milestone's total cost, taken from the tables of the earlier blocks.
+journey = [
+    ("Random forest,\n450 sensors (B9)",
+     float(selection_comparison[selection_comparison["feature_set"] == "all sensors (Block 9)"]["cost_eur"].iloc[0])),
+    ("Random forest,\n18 sensors (B10)",
+     float(selection_comparison[selection_comparison["feature_set"] == "Boruta selected (D10)"]["cost_eur"].iloc[0])),
+    ("+ ROSE\n(B11)", float(balancing_comparison[balancing_comparison["option"] == "ROSE"]["cost_eur"].iloc[0])),
+    ("Leak-proof\npipeline (B13)", float(pipeline_comparison["cost_eur"].iloc[1])),
+    ("EasyEnsemble\nat 0.5 (B14)",
+     float(model_matrix[model_matrix["combination"] == candidate_names[final_family]]["cost_at_0.5"].iloc[0])),
+    ("Tuned, at 0.5\n(B15-16)", float(default_row["cost_eur"])),
+    ("Tuned, at " + str(final_threshold) + "\n(B16)", float(final_row["cost_eur"]))]
+journey_rows = []
+for label, cost in journey:
+    journey_rows.append({"stage": label.replace("\n", " "), "set": "cross-validated training",
+                         "cost_eur": int(cost), "cost_per_wafer_eur": round(cost / len(y_train), 1)})
+journey_rows.append({"stage": "FINAL TEST (B17)", "set": "test", "cost_eur": int(test_result["cost_eur"]),
+                     "cost_per_wafer_eur": round(test_result["cost_eur"] / len(y_test), 1)})
+journey_table = pd.DataFrame(journey_rows)
+print(journey_table.to_string(index=False))
+journey_table.to_csv(TABLES_FOLDER / "block18_cost_journey.csv", index=False)
+
+# Figure: cost per wafer at each milestone; the final test in blue, and the
+# cost of inspecting every wafer as a dashed reference line.
+inspect_all_per_wafer = (len(y_train) - failed_training) * COST_FALSE_POSITIVE / len(y_train)
+figure, axis = plt.subplots(figsize=(13, 6))
+bar_labels = []
+bar_values = []
+bar_colors = []
+for label, cost in journey:
+    bar_labels.append(label)
+    bar_values.append(cost / len(y_train))
+    bar_colors.append(OTHER_COLOR)
+bar_labels.append("FINAL TEST\n(B17)")
+bar_values.append(test_result["cost_eur"] / len(y_test))
+bar_colors.append(FINAL_COLOR)
+axis.bar(range(len(bar_values)), bar_values, color=bar_colors)
+for position in range(len(bar_values)):
+    axis.text(position, bar_values[position] + 5, "EUR " + str(int(round(bar_values[position]))),
+              ha="center", fontsize=10)
+axis.axhline(inspect_all_per_wafer, linestyle="--", color=COLOR_REFERENCE)
+axis.text(len(bar_values) - 0.5, inspect_all_per_wafer + 5, "inspect every wafer: EUR "
+          + str(int(round(inspect_all_per_wafer))), ha="right", fontsize=9, color=COLOR_REFERENCE)
+axis.set_xticks(range(len(bar_values)))
+axis.set_xticklabels(bar_labels, fontsize=9)
+presentation_axis(axis, "Cost per wafer across the project: from EUR " + str(int(round(bar_values[0])))
+                  + " to EUR " + str(int(round(bar_values[-2]))) + " (cross-validated) and EUR "
+                  + str(int(round(bar_values[-1]))) + " on the final test",
+                  "", "Cost per wafer (EUR)")
+save_figure(figure, "block18_01_cost_journey.png")
+
+
+# ----- 18.3 Save the fitted final pipeline once (manual 17.2) -----
+print("\n--- 18.3 Final pipeline saved ---")
+# joblib.dump writes the fitted pipeline (scaler, imputer, sensor list, model)
+# to one file; joblib.load gives it back without refitting. The file can only be
+# loaded with the same package versions (requirements.txt).
+MODELS_FOLDER = PROJECT_FOLDER / "results" / "models"
+MODELS_FOLDER.mkdir(parents=True, exist_ok=True)
+pipeline_file = MODELS_FOLDER / "block18_final_pipeline.joblib"
+joblib.dump(final_pipeline, pipeline_file)
+# Check: the reloaded pipeline gives exactly the same test probabilities.
+reloaded_pipeline = joblib.load(pipeline_file)
+reloaded_probabilities = reloaded_pipeline.predict_proba(X_test_treated)[:, 1]
+print("Saved:", pipeline_file, "| size", round(pipeline_file.stat().st_size / 1024 / 1024, 2), "MB")
+print("Reloaded pipeline gives identical test probabilities:",
+      bool(np.array_equal(reloaded_probabilities, test_probabilities.to_numpy())))
+
+
+# ----- 18.4 Reproducibility record (manual 17.2) -----
+print("\n--- 18.4 Reproducibility record ---")
+# SHA-256 turns each downloaded file into a 64-character fingerprint; the same
+# file always gives the same fingerprint, and one changed byte changes it completely.
+record_rows = [
+    {"item": "run date (data accessed)", "value": str(datetime.date.today())},
+    {"item": "produced on", "value": "local machine, " + platform.system() + " " + platform.release()},
+    {"item": "Python", "value": platform.python_version()},
+    {"item": "random seed (split, balancing, models, CV)", "value": str(SEED)},
+    {"item": "costs (false alarm / missed failure, EUR)",
+     "value": str(COST_FALSE_POSITIVE) + " / " + str(COST_FALSE_NEGATIVE)}]
+for file_name, url, content in [("secom.data", URL_SENSOR_DATA, sensor_bytes),
+                                ("secom_labels.data", URL_LABELS, label_bytes)]:
+    record_rows.append({"item": "source " + file_name, "value": url})
+    record_rows.append({"item": "size of " + file_name + " (bytes)", "value": str(len(content))})
+    record_rows.append({"item": "SHA-256 of " + file_name, "value": hashlib.sha256(content).hexdigest()})
+for package_name in REQUIRED_PACKAGES:
+    record_rows.append({"item": "package " + package_name, "value": importlib.metadata.version(package_name)})
+reproducibility_record = pd.DataFrame(record_rows)
+print(reproducibility_record.to_string(index=False))
+reproducibility_record.to_csv(TABLES_FOLDER / "block18_reproducibility.csv", index=False)
+
+
+# ----- 18.5 Final summary -----
+print("\n--- 18.5 Final summary ---")
+print("Final model:", display_name(final_family), "(" + final_choice["setting"], "=", str(final_choice["value"]) + "),",
+      "outliers", final_choice["outlier"] + ", k =", final_choice["k"], ",", len(selected_features), "sensors,",
+      "threshold", final_threshold)
+print("Cross-validated (training):", cv_result["TP"], "of", failed_training, "failures caught, cost EUR",
+      format(cv_result["cost_eur"], ","), "(EUR", round(cv_result["cost_eur"] / len(y_train)), "per wafer)")
+print("FINAL TEST:", test_result["TP"], "of", test_failures, "failures caught, recall", test_result["recall"],
+      "| specificity", test_result["specificity"], "| ROC-AUC", test_result["ROC_AUC"], "| cost EUR",
+      format(test_result["cost_eur"], ","), "(EUR", round(test_result["cost_eur"] / len(y_test)), "per wafer)")
+print("\nPhase 3 finished.")
 
